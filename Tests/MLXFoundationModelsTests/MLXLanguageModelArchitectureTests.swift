@@ -28,7 +28,27 @@ struct MLXLanguageModelArchitectureTests {
         #expect(plan.toolPolicy == .disabled)
         #expect(plan.responseMode == .text)
         #expect(plan.plannerDiagnostics.toolDefinitionCount == 0)
-        #expect(plan.cachePlan.reuseScope == .prefixReusable)
+        #expect(plan.cachePlan.reuseScope == .none)
+        #expect(plan.cachePlan.prefixInput == nil)
+    }
+
+    @Test("Planner only reuses prefixes that contain a standalone user query")
+    func plannerReusesStandalonePrefixAfterAssistantTurn() throws {
+        let transcript = Transcript(entries: [
+            .instructions(.init(segments: [.text(.init(content: "You are helpful."))], toolDefinitions: [])),
+            .prompt(.init(segments: [.text(.init(content: "こんにちは"))])),
+            .response(.init(assetIDs: [], segments: [.text(.init(content: "こんにちは。"))])),
+            .prompt(.init(segments: [.text(.init(content: "続けて"))])),
+        ])
+
+        let plan = try planner.plan(
+            transcript: transcript,
+            options: nil,
+            metadata: denseSmallMetadata()
+        )
+
+        #expect(plan.cachePlan.reuseScope == MLXCacheReuseScope.prefixReusable)
+        #expect(plan.cachePlan.prefixInput != nil)
     }
 
     @Test("Planner enables tools for non-small-talk requests even without keyword matches")
@@ -44,9 +64,11 @@ struct MLXLanguageModelArchitectureTests {
             metadata: denseSmallMetadata()
         )
 
-        #expect(plan.toolPolicy == .enabled)
+        #expect(plan.toolPolicy == .required)
         #expect(plan.responseMode == .toolCapable)
         #expect(plan.plannerDiagnostics.toolDefinitionCount == 1)
+        #expect(plan.plannerDiagnostics.latestUserPreview == "東京の天気を教えて")
+        #expect(plan.input.prompt.description.contains("This request requires a tool call before answering."))
     }
 
     @Test("Planner requires tools when continuing an unresolved tool loop")
@@ -75,10 +97,29 @@ struct MLXLanguageModelArchitectureTests {
         #expect(plan.plannerDiagnostics.toolDefinitionCount == 1)
     }
 
+    @Test("Planner requires tools for current location requests")
+    func plannerRequiresToolsForCurrentLocationRequest() throws {
+        let transcript = Transcript(entries: [
+            .instructions(.init(segments: [.text(.init(content: "Use tools when needed."))], toolDefinitions: [searchToolDefinition()])),
+            .prompt(.init(segments: [.text(.init(content: "現在地を教えてください"))])),
+        ])
+
+        let plan = try planner.plan(
+            transcript: transcript,
+            options: nil,
+            metadata: denseSmallMetadata()
+        )
+
+        #expect(plan.toolPolicy == .required)
+        #expect(plan.input.prompt.description.contains("Do not answer from memory"))
+    }
+
     @Test("Planner cache key changes when schema changes")
     func plannerCacheKeyChangesWhenSchemaChanges() throws {
         let baseEntries: [Transcript.Entry] = [
             .instructions(.init(segments: [.text(.init(content: "Return structured data."))], toolDefinitions: [])),
+            .prompt(.init(segments: [.text(.init(content: "Hello"))])),
+            .response(.init(assetIDs: [], segments: [.text(.init(content: "Hi"))])),
         ]
 
         let stringTranscript = Transcript(entries: baseEntries + [
@@ -148,6 +189,48 @@ struct MLXLanguageModelArchitectureTests {
         #expect(vlmProfile.kvBits == 4)
     }
 
+    @Test("Prefix reuse validator rejects mismatched prefix snapshots")
+    func prefixReuseValidatorRejectsMismatchedPrefix() {
+        let result = MLXPrefixReuseValidator.validate(
+            fullTokens: [1, 2, 3, 4],
+            prefixTokens: [1, 9],
+            requestedPrefixTokenCount: 2,
+            successOutcome: "hit"
+        )
+
+        #expect(result.acceptedPrefixTokenCount == nil)
+        #expect(result.outcome == MLXCacheInvalidationReason.prefixSnapshotMismatch.rawValue)
+        #expect(result.shouldInvalidate)
+    }
+
+    @Test("Prefix reuse validator clamps reused token count to actual prefix length")
+    func prefixReuseValidatorClampsToActualPrefixLength() {
+        let result = MLXPrefixReuseValidator.validate(
+            fullTokens: [1, 2, 3, 4, 5],
+            prefixTokens: [1, 2, 3],
+            requestedPrefixTokenCount: 4,
+            successOutcome: "built"
+        )
+
+        #expect(result.acceptedPrefixTokenCount == 3)
+        #expect(result.outcome == "built")
+        #expect(!result.shouldInvalidate)
+    }
+
+    @Test("Prefix reuse validator rejects prefixes that consume the full prompt")
+    func prefixReuseValidatorRejectsFullPromptPrefixes() {
+        let result = MLXPrefixReuseValidator.validate(
+            fullTokens: [1, 2, 3],
+            prefixTokens: [1, 2, 3],
+            requestedPrefixTokenCount: 3,
+            successOutcome: "hit"
+        )
+
+        #expect(result.acceptedPrefixTokenCount == nil)
+        #expect(result.outcome == MLXCacheInvalidationReason.prefixSnapshotMismatch.rawValue)
+        #expect(result.shouldInvalidate)
+    }
+
     @Test("Assembler strips think blocks from final text responses")
     func assemblerStripsThinkBlocks() throws {
         let entry = try assembler.finalEntry(
@@ -204,6 +287,16 @@ struct MLXLanguageModelArchitectureTests {
         #expect(query == "swift")
     }
 
+    @Test("Assembler rejects empty required-tool completions")
+    func assemblerRejectsEmptyRequiredToolCompletion() throws {
+        #expect(throws: MLXResponseAssemblyError.self) {
+            try assembler.validate(
+                plan: makePlan(responseMode: .toolCapable, toolPolicy: .required),
+                events: [.info, .completed]
+            )
+        }
+    }
+
     @Test("Streaming sanitizer never emits think content")
     func streamingSanitizerSuppressesThinkBlocks() {
         var state = MLXStreamingResponseState()
@@ -256,7 +349,8 @@ private func makePlan(
             assistantMessageCount: 0,
             toolMessageCount: 0,
             imageCount: 0,
-            toolDefinitionCount: tools?.count ?? 0
+            toolDefinitionCount: tools?.count ?? 0,
+            latestUserPreview: "hello"
         )
     )
 }

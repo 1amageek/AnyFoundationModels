@@ -18,12 +18,18 @@ struct MLXExecutionPreparation {
 }
 
 struct MLXExecutor {
-    func prepareExecution(
+    func prepareInput(
         container: ModelContainer,
-        plan: MLXExecutionPlan,
+        input: consuming sending UserInput
+    ) async throws -> (input: LMInput, promptTokenCount: Int) {
+        let fullInput = try await container.prepare(input: input)
+        return (fullInput, fullInput.text.tokens.size)
+    }
+
+    func makeExecutionPreparation(
+        input fullInput: consuming sending LMInput,
         reuseDecision: MLXCacheReuseDecision
-    ) async throws -> MLXExecutionPreparation {
-        let fullInput = try await container.prepare(input: plan.input)
+    ) -> MLXExecutionPreparation {
         let promptTokenCount = fullInput.text.tokens.size
 
         guard let prefixTokenCount = reuseDecision.prefixTokenCount,
@@ -103,12 +109,12 @@ struct MLXExecutor {
         }
     }
 
-    func buildPrefixCache(
+    func buildPrefixSnapshot(
         container: ModelContainer,
         input: consuming sending UserInput,
         parameters: GenerateParameters
-    ) async throws -> (cache: [KVCache], prefixTokenCount: Int) {
-        let lmInput = try await container.prepare(input: input)
+    ) async throws -> PromptCacheSnapshot {
+        let lmInput = try await container.preparePrefix(input: input)
         return try await container.perform { context in
             var cache = context.model.newCache(parameters: parameters)
             let prefixTokenCount = lmInput.text.tokens.size
@@ -133,7 +139,10 @@ struct MLXExecutor {
                 eval(output.logits)
             }
 
-            return (cache, prefixTokenCount)
+            return try capturePromptCache(
+                cache: cache,
+                prefixTokenCount: prefixTokenCount
+            )
         }
     }
 }

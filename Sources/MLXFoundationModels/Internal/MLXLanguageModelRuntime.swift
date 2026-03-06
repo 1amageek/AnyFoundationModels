@@ -1,9 +1,19 @@
 #if MLX_ENABLED
 import Foundation
+import MLX
 import OpenFoundationModels
 @preconcurrency import MLXLMCommon
 
 actor MLXLanguageModelRuntime {
+    private struct PreparedRun {
+        let metadata: MLXModelMetadata
+        let plan: MLXExecutionPlan
+        let preparation: MLXExecutionPreparation
+        let parameters: GenerateParameters
+        let cache: [KVCache]?
+        let prefixDebugSummary: String?
+    }
+
     private let modelContainer: ModelContainer
     private let planner = MLXTranscriptPlanner()
     private let tuner = MLXGenerationTuner()
@@ -24,16 +34,8 @@ actor MLXLanguageModelRuntime {
         options: GenerationOptions?
     ) async throws -> Transcript.Entry {
         let result = try await execute(transcript: transcript, options: options)
-        let entry = try assembler.finalEntry(plan: result.plan, events: result.events)
-
-        if shouldWarmPrefixCache(for: entry, toolPolicy: result.plan.toolPolicy) {
-            let nextTranscript = Transcript(entries: Array(transcript) + [entry])
-            Task {
-                await self.warmPrefixCache(transcript: nextTranscript, options: options)
-            }
-        }
-
-        return entry
+        try assembler.validate(plan: result.plan, events: result.events)
+        return try assembler.finalEntry(plan: result.plan, events: result.events)
     }
 
     func stream(
@@ -43,37 +45,27 @@ actor MLXLanguageModelRuntime {
         AsyncThrowingStream { continuation in
             let task = Task {
                 do {
-                    let metadata = await self.resolveMetadata()
-                    let plan = try self.planner.plan(transcript: transcript, options: options, metadata: metadata)
-                    let reuseDecision = self.prefixCacheStore.lookup(plan: plan, metadata: metadata)
-
-                    let preparation = try await self.executor.prepareExecution(
-                        container: self.modelContainer,
-                        plan: plan,
-                        reuseDecision: reuseDecision
+                    let prepared = try await self.prepareRun(
+                        transcript: transcript,
+                        options: options
                     )
-                    let profile = self.tuner.makeProfile(
-                        plan: plan,
-                        metadata: metadata,
-                        promptTokenCount: preparation.promptTokenCount
-                    )
-                    let parameters = self.tuner.makeParameters(options: options, profile: profile)
 
                     await self.logPlan(
-                        metadata: metadata,
-                        plan: plan,
-                        promptTokenCount: preparation.promptTokenCount,
-                        parameters: parameters,
-                        cacheOutcome: preparation.cacheOutcome
+                        metadata: prepared.metadata,
+                        plan: prepared.plan,
+                        promptTokenCount: prepared.preparation.promptTokenCount,
+                        parameters: prepared.parameters,
+                        cacheOutcome: prepared.preparation.cacheOutcome,
+                        prefixDebugSummary: prepared.prefixDebugSummary
                     )
 
                     let startedAt = Date()
                     let stream = try await self.executor.execute(
                         container: self.modelContainer,
-                        input: preparation.input,
-                        cache: reuseDecision.cache,
-                        parameters: parameters,
-                        reusedPrefixTokenCount: preparation.reusedPrefixTokenCount
+                        input: prepared.preparation.input,
+                        cache: prepared.cache,
+                        parameters: prepared.parameters,
+                        reusedPrefixTokenCount: prepared.preparation.reusedPrefixTokenCount
                     )
 
                     var events: [MLXGenerationEvent] = []
@@ -90,7 +82,7 @@ actor MLXLanguageModelRuntime {
 
                         switch event {
                         case .textChunk(let text):
-                            if plan.toolPolicy == .disabled {
+                            if prepared.plan.toolPolicy == .disabled {
                                 let result = self.assembler.streamDelta(state: streamingState, chunk: text)
                                 streamingState = result.state
                                 if !result.delta.isEmpty {
@@ -101,15 +93,16 @@ actor MLXLanguageModelRuntime {
                         case .nativeToolCall, .info:
                             break
                         case .completed:
-                            if plan.toolPolicy != .disabled {
-                                let finalEntry = try self.assembler.finalEntry(plan: plan, events: events)
+                            if prepared.plan.toolPolicy != .disabled {
+                                try self.assembler.validate(
+                                    plan: prepared.plan,
+                                    events: events
+                                )
+                                let finalEntry = try self.assembler.finalEntry(
+                                    plan: prepared.plan,
+                                    events: events
+                                )
                                 continuation.yield(finalEntry)
-                                if self.shouldWarmPrefixCache(for: finalEntry, toolPolicy: plan.toolPolicy) {
-                                    let nextTranscript = Transcript(entries: Array(transcript) + [finalEntry])
-                                    Task {
-                                        await self.warmPrefixCache(transcript: nextTranscript, options: options)
-                                    }
-                                }
                             } else {
                                 let finalText = self.assembler.sanitizeAssistantResponse(streamingState.rawText)
                                 if !finalText.isEmpty, finalText != streamingState.emittedVisibleText {
@@ -127,11 +120,11 @@ actor MLXLanguageModelRuntime {
                     }
 
                     await self.recordDiagnostics(
-                        metadata: metadata,
-                        plan: plan,
-                        promptTokenCount: preparation.promptTokenCount,
-                        cacheOutcome: preparation.cacheOutcome,
-                        parameters: parameters,
+                        metadata: prepared.metadata,
+                        plan: prepared.plan,
+                        promptTokenCount: prepared.preparation.promptTokenCount,
+                        cacheOutcome: prepared.preparation.cacheOutcome,
+                        parameters: prepared.parameters,
                         startedAt: startedAt,
                         events: events,
                         firstChunkLatency: firstChunkLatency
@@ -155,38 +148,24 @@ actor MLXLanguageModelRuntime {
         transcript: Transcript,
         options: GenerationOptions?
     ) async throws -> (plan: MLXExecutionPlan, events: [MLXGenerationEvent], firstChunkLatency: TimeInterval?) {
-        let metadata = await resolveMetadata()
-        let plan = try planner.plan(transcript: transcript, options: options, metadata: metadata)
-        let reuseDecision = prefixCacheStore.lookup(plan: plan, metadata: metadata)
-
-        let preparation = try await executor.prepareExecution(
-            container: modelContainer,
-            plan: plan,
-            reuseDecision: reuseDecision
-        )
-        let profile = tuner.makeProfile(
-            plan: plan,
-            metadata: metadata,
-            promptTokenCount: preparation.promptTokenCount
-        )
-        tuningProfile = profile
-        let parameters = tuner.makeParameters(options: options, profile: profile)
+        let prepared = try await prepareRun(transcript: transcript, options: options)
 
         await logPlan(
-            metadata: metadata,
-            plan: plan,
-            promptTokenCount: preparation.promptTokenCount,
-            parameters: parameters,
-            cacheOutcome: preparation.cacheOutcome
+            metadata: prepared.metadata,
+            plan: prepared.plan,
+            promptTokenCount: prepared.preparation.promptTokenCount,
+            parameters: prepared.parameters,
+            cacheOutcome: prepared.preparation.cacheOutcome,
+            prefixDebugSummary: prepared.prefixDebugSummary
         )
 
         let startedAt = Date()
         let stream = try await executor.execute(
             container: modelContainer,
-            input: preparation.input,
-            cache: reuseDecision.cache,
-            parameters: parameters,
-            reusedPrefixTokenCount: preparation.reusedPrefixTokenCount
+            input: prepared.preparation.input,
+            cache: prepared.cache,
+            parameters: prepared.parameters,
+            reusedPrefixTokenCount: prepared.preparation.reusedPrefixTokenCount
         )
 
         var events: [MLXGenerationEvent] = []
@@ -200,17 +179,17 @@ actor MLXLanguageModelRuntime {
         }
 
         await recordDiagnostics(
-            metadata: metadata,
-            plan: plan,
-            promptTokenCount: preparation.promptTokenCount,
-            cacheOutcome: preparation.cacheOutcome,
-            parameters: parameters,
+            metadata: prepared.metadata,
+            plan: prepared.plan,
+            promptTokenCount: prepared.preparation.promptTokenCount,
+            cacheOutcome: prepared.preparation.cacheOutcome,
+            parameters: prepared.parameters,
             startedAt: startedAt,
             events: events,
             firstChunkLatency: firstChunkLatency
         )
 
-        return (plan, events, firstChunkLatency)
+        return (prepared.plan, events, firstChunkLatency)
     }
 
     private func resolveMetadata() async -> MLXModelMetadata {
@@ -225,82 +204,151 @@ actor MLXLanguageModelRuntime {
         return resolved
     }
 
-    private func shouldWarmPrefixCache(
-        for entry: Transcript.Entry,
-        toolPolicy: MLXToolPolicy
-    ) -> Bool {
-        guard toolPolicy == .disabled else {
-            return false
-        }
-        if case .response = entry {
-            return true
-        }
-        return false
-    }
-
-    private func warmPrefixCache(
+    private func prepareRun(
         transcript: Transcript,
         options: GenerationOptions?
-    ) async {
-        do {
-            let metadata = await resolveMetadata()
-            guard let warmupPlan = try planner.warmupPlan(
-                transcript: transcript,
-                options: options,
-                metadata: metadata
-            ) else {
-                return
-            }
+    ) async throws -> PreparedRun {
+        let metadata = await resolveMetadata()
+        let plan = try planner.plan(transcript: transcript, options: options, metadata: metadata)
+        let preparedInput = try await executor.prepareInput(
+            container: modelContainer,
+            input: plan.input
+        )
+        let profile = tuner.makeProfile(
+            plan: plan,
+            metadata: metadata,
+            promptTokenCount: preparedInput.promptTokenCount
+        )
+        tuningProfile = profile
+        let parameters = tuner.makeParameters(options: options, profile: profile)
+        let reuseDecision = try await resolveReuseDecision(
+            plan: plan,
+            metadata: metadata,
+            parameters: parameters,
+            fullInput: preparedInput.input
+        )
+        let preparation = executor.makeExecutionPreparation(
+            input: preparedInput.input,
+            reuseDecision: reuseDecision
+        )
+        let prefixDebugSummary = await makePrefixDebugSummary(
+            plan: plan,
+            fullInput: preparation.input,
+            reuseDecision: reuseDecision
+        )
 
-            let profile = tuner.makeProfile(
-                plan: MLXExecutionPlan(
-                    input: warmupPlan.input,
-                    responseMode: .text,
-                    toolPolicy: .disabled,
-                    cachePlan: MLXCachePlan(
-                        reuseScope: .prefixReusable,
-                        cacheKey: warmupPlan.cacheKey,
-                        prefixMessages: [],
-                        suffixMessages: [],
-                        prefixInput: warmupPlan.input
-                    ),
-                    promptTokenEstimate: nil,
-                    schemaFingerprint: nil,
-                    additionalContext: [:],
-                    plannerDiagnostics: .init(
-                        systemMessageCount: 0,
-                        userMessageCount: 0,
-                        assistantMessageCount: 0,
-                        toolMessageCount: 0,
-                        imageCount: 0,
-                        toolDefinitionCount: 0
-                    )
-                ),
-                metadata: metadata,
-                promptTokenCount: nil
+        return PreparedRun(
+            metadata: metadata,
+            plan: plan,
+            preparation: preparation,
+            parameters: parameters,
+            cache: reuseDecision.cache,
+            prefixDebugSummary: prefixDebugSummary
+        )
+    }
+
+    private func resolveReuseDecision(
+        plan: MLXExecutionPlan,
+        metadata: MLXModelMetadata,
+        parameters: GenerateParameters,
+        fullInput: LMInput
+    ) async throws -> MLXCacheReuseDecision {
+        let cachedDecision = prefixCacheStore.lookup(plan: plan, metadata: metadata)
+        if cachedDecision.cache != nil {
+            return try await validatedReuseDecision(
+                decision: cachedDecision,
+                plan: plan,
+                fullInput: fullInput,
+                cacheKey: plan.cachePlan.cacheKey
             )
-            let parameters = tuner.makeParameters(options: options, profile: profile)
-            let built = try await executor.buildPrefixCache(
+        }
+
+        if plan.cachePlan.reuseScope != .prefixReusable {
+            return cachedDecision
+        }
+
+        guard let cacheKey = plan.cachePlan.cacheKey,
+              let prefixInput = plan.cachePlan.prefixInput
+        else {
+            return cachedDecision
+        }
+
+        do {
+            let snapshot = try await executor.buildPrefixSnapshot(
                 container: modelContainer,
-                input: warmupPlan.input,
+                input: prefixInput,
                 parameters: parameters
             )
-
-            prefixCacheStore.store(
-                cacheKey: warmupPlan.cacheKey,
-                kvCache: built.cache,
-                prefixTokenCount: built.prefixTokenCount,
-                metadata: metadata
+            let builtDecision = MLXCacheReuseDecision(
+                cache: try materializePromptCache(from: snapshot),
+                prefixTokenCount: snapshot.prefixTokenCount,
+                outcome: "built"
             )
-
-            #if DEBUG
-            print(
-                "[MLXLanguageModel] prefixCache stored modelID=\(metadata.modelID) tokens=\(built.prefixTokenCount)"
+            let validatedDecision = try await validatedReuseDecision(
+                decision: builtDecision,
+                plan: plan,
+                fullInput: fullInput,
+                cacheKey: cacheKey
             )
-            #endif
+            if validatedDecision.cache != nil {
+                prefixCacheStore.store(
+                    cacheKey: cacheKey,
+                    snapshot: snapshot,
+                    metadata: metadata
+                )
+
+                #if DEBUG
+                print(
+                    "[MLXLanguageModel] prefixCache stored modelID=\(metadata.modelID) tokens=\(snapshot.prefixTokenCount)"
+                )
+                #endif
+            }
+            return validatedDecision
         } catch {
-            Logger.warning("[MLXLanguageModel] Failed to warm prefix cache: \(error)")
+            Logger.warning("[MLXLanguageModel] Prefix snapshot build skipped: \(error)")
+            return .noReuse(reason: .prefixSnapshotUnsupported)
         }
+    }
+
+    private func validatedReuseDecision(
+        decision: MLXCacheReuseDecision,
+        plan: MLXExecutionPlan,
+        fullInput: LMInput,
+        cacheKey: MLXPrefixCacheKey?
+    ) async throws -> MLXCacheReuseDecision {
+        guard let cache = decision.cache,
+              let prefixInput = plan.cachePlan.prefixInput
+        else {
+            return decision
+        }
+
+        let prefixPrepared = try await modelContainer.preparePrefix(input: prefixInput)
+        let fullTokens = flattenedTokenIDs(from: fullInput.text.tokens)
+        let prefixTokens = flattenedTokenIDs(from: prefixPrepared.text.tokens)
+        let validation = MLXPrefixReuseValidator.validate(
+            fullTokens: fullTokens,
+            prefixTokens: prefixTokens,
+            requestedPrefixTokenCount: decision.prefixTokenCount,
+            successOutcome: decision.outcome
+        )
+
+        if validation.shouldInvalidate, let cacheKey {
+            prefixCacheStore.invalidate(cacheKey: cacheKey)
+        }
+
+        guard let acceptedPrefixTokenCount = validation.acceptedPrefixTokenCount else {
+            return MLXCacheReuseDecision(
+                cache: nil,
+                prefixTokenCount: nil,
+                outcome: validation.outcome
+            )
+        }
+
+        return MLXCacheReuseDecision(
+            cache: cache,
+            prefixTokenCount: acceptedPrefixTokenCount,
+            outcome: validation.outcome
+        )
     }
 
     private func logPlan(
@@ -308,12 +356,16 @@ actor MLXLanguageModelRuntime {
         plan: MLXExecutionPlan,
         promptTokenCount: Int,
         parameters: GenerateParameters,
-        cacheOutcome: String
+        cacheOutcome: String,
+        prefixDebugSummary: String?
     ) async {
         #if DEBUG
         print(
-            "[MLXLanguageModel] plan modelID=\(metadata.modelID) runtime=\(metadata.runtimeFamily.rawValue) toolPolicy=\(plan.toolPolicy.rawValue) promptTokens=\(promptTokenCount) cache=\(cacheOutcome) prefillStep=\(parameters.prefillStepSize) kvBits=\(String(describing: parameters.kvBits)) maxKVSize=\(String(describing: parameters.maxKVSize))"
+            "[MLXLanguageModel] plan modelID=\(metadata.modelID) runtime=\(metadata.runtimeFamily.rawValue) toolPolicy=\(plan.toolPolicy.rawValue) promptTokens=\(promptTokenCount) cache=\(cacheOutcome) tools=\(plan.plannerDiagnostics.toolDefinitionCount) latestUser=\"\(plan.plannerDiagnostics.latestUserPreview)\" prefixMessages=\(plan.cachePlan.prefixMessages.count) suffixMessages=\(plan.cachePlan.suffixMessages.count) prefillStep=\(parameters.prefillStepSize) kvBits=\(String(describing: parameters.kvBits)) maxKVSize=\(String(describing: parameters.maxKVSize))"
         )
+        if let prefixDebugSummary {
+            print("[MLXLanguageModel] prefixDebug \(prefixDebugSummary)")
+        }
         #endif
     }
 
@@ -345,10 +397,72 @@ actor MLXLanguageModelRuntime {
         )
 
         #if DEBUG
+        let rawPreview = previewText(collected.text)
+        let sanitizedPreview = previewText(assembler.sanitizeAssistantResponse(collected.text))
+        let textualToolCallDetected = ToolCallDetector.entryIfPresent(
+            assembler.sanitizeAssistantResponse(collected.text)
+        ) != nil
         print(
-            "[MLXLanguageModel] completed runtime=\(metadata.runtimeFamily.rawValue) toolPolicy=\(plan.toolPolicy.rawValue) promptTokens=\(promptTokenCount) cache=\(cacheOutcome) chars=\(collected.text.count) nativeCalls=\(collected.nativeToolCalls.count)"
+            "[MLXLanguageModel] completed runtime=\(metadata.runtimeFamily.rawValue) toolPolicy=\(plan.toolPolicy.rawValue) promptTokens=\(promptTokenCount) cache=\(cacheOutcome) chars=\(collected.text.count) nativeCalls=\(collected.nativeToolCalls.count) textualToolCall=\(textualToolCallDetected) rawPreview=\"\(rawPreview)\" sanitizedPreview=\"\(sanitizedPreview)\""
         )
         #endif
+    }
+
+    private func makePrefixDebugSummary(
+        plan: MLXExecutionPlan,
+        fullInput: LMInput,
+        reuseDecision: MLXCacheReuseDecision
+    ) async -> String? {
+        #if DEBUG
+        guard let prefixInput = plan.cachePlan.prefixInput else {
+            return nil
+        }
+
+        do {
+            let prefixPrepared = try await modelContainer.preparePrefix(input: prefixInput)
+            let fullTokens = flattenedTokenIDs(from: fullInput.text.tokens)
+            let prefixTokens = flattenedTokenIDs(from: prefixPrepared.text.tokens)
+            let reusedPrefixTokenCount = reuseDecision.prefixTokenCount ?? 0
+            let prefixMatchesFull = fullTokens.count >= prefixTokens.count
+                && Array(fullTokens.prefix(prefixTokens.count)) == prefixTokens
+            let suffixTokens = reusedPrefixTokenCount <= fullTokens.count
+                ? Array(fullTokens.dropFirst(reusedPrefixTokenCount))
+                : []
+            let prefixTail = Array(prefixTokens.suffix(12))
+            let suffixHead = Array(suffixTokens.prefix(12))
+            let suffixPreview = await decodedPreview(tokens: suffixTokens)
+
+            return "preparedPrefixTokens=\(prefixTokens.count) reusedPrefixTokens=\(reusedPrefixTokenCount) prefixMatchesFull=\(prefixMatchesFull) suffixTokens=\(suffixTokens.count) prefixTail=\(prefixTail) suffixHead=\(suffixHead) suffixPreview=\"\(suffixPreview)\""
+        } catch {
+            return "error=\(error)"
+        }
+        #else
+        return nil
+        #endif
+    }
+
+    private func flattenedTokenIDs(from tokens: MLXArray) -> [Int] {
+        tokens.flattened().asArray(Int.self)
+    }
+
+    private func decodedPreview(tokens: [Int]) async -> String {
+        guard !tokens.isEmpty else {
+            return ""
+        }
+        let previewTokens = Array(tokens.prefix(48))
+        let decoded = await modelContainer.decode(tokens: previewTokens)
+        return previewText(decoded)
+    }
+
+    private func previewText(_ text: String, limit: Int = 160) -> String {
+        let normalized = text
+            .replacingOccurrences(of: "\n", with: "\\n")
+            .replacingOccurrences(of: "\r", with: "\\r")
+        if normalized.count <= limit {
+            return normalized
+        }
+        let endIndex = normalized.index(normalized.startIndex, offsetBy: limit)
+        return String(normalized[..<endIndex]) + "..."
     }
 }
 #endif

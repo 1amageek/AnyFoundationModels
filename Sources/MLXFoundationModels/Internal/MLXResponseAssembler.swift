@@ -3,6 +3,17 @@ import Foundation
 import OpenFoundationModels
 import OpenFoundationModelsExtra
 
+enum MLXResponseAssemblyError: LocalizedError, Equatable {
+    case missingRequiredToolResponse
+
+    var errorDescription: String? {
+        switch self {
+        case .missingRequiredToolResponse:
+            return "Model completed without returning text or a tool call for a required-tool turn."
+        }
+    }
+}
+
 struct MLXCollectedOutput: Sendable {
     var text: String
     var nativeToolCalls: [(name: String, argsJSON: String)]
@@ -40,6 +51,7 @@ struct MLXResponseAssembler {
         plan: MLXExecutionPlan,
         events: [MLXGenerationEvent]
     ) throws -> Transcript.Entry {
+        try validate(plan: plan, events: events)
         let collected = collect(events: events)
         if !collected.nativeToolCalls.isEmpty,
            let toolEntry = try nativeToolCallEntry(from: collected.nativeToolCalls) {
@@ -57,6 +69,21 @@ struct MLXResponseAssembler {
             responseMode: plan.responseMode,
             fallbackText: collected.text.isEmpty ? "" : sanitized
         )
+    }
+
+    func validate(
+        plan: MLXExecutionPlan,
+        events: [MLXGenerationEvent]
+    ) throws {
+        let collected = collect(events: events)
+        let sanitized = sanitizeAssistantResponse(collected.text)
+
+        if plan.toolPolicy == .required,
+           collected.nativeToolCalls.isEmpty,
+           ToolCallDetector.entryIfPresent(sanitized) == nil,
+           sanitized.isEmpty {
+            throw MLXResponseAssemblyError.missingRequiredToolResponse
+        }
     }
 
     func streamEntry(for chunk: String) -> Transcript.Entry {

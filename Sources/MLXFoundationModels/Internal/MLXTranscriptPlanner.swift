@@ -22,6 +22,8 @@ enum MLXCacheInvalidationReason: String, Sendable, Equatable {
     case noReusablePrefix
     case noStoredCache
     case cacheKeyChanged
+    case prefixSnapshotUnsupported
+    case prefixSnapshotMismatch
 }
 
 enum MLXCacheReuseScope: Sendable, Equatable {
@@ -41,6 +43,7 @@ struct MLXPlannerDiagnostics: Sendable, Equatable {
     let toolMessageCount: Int
     let imageCount: Int
     let toolDefinitionCount: Int
+    let latestUserPreview: String
 }
 
 struct MLXCachePlan {
@@ -85,15 +88,32 @@ internal struct MLXTranscriptPlanner: OpenFoundationModelsExtra.RequestBuilder {
         metadata: MLXModelMetadata
     ) throws -> MLXExecutionPlan {
         let resolved = transcript.resolved()
-        let messages = try canonicalMessages(from: resolved)
+        let latestPromptText = latestPromptText(from: resolved)
         let toolPolicy = decideToolPolicy(resolved: resolved, metadata: metadata)
+        let toolDirective = toolDirective(
+            latestPromptText: latestPromptText,
+            toolPolicy: toolPolicy,
+            availableTools: resolved.toolDefinitions
+        )
+        let selectedToolDefinitions = selectToolDefinitions(
+            from: resolved.toolDefinitions,
+            latestPromptText: latestPromptText,
+            toolPolicy: toolPolicy,
+            hasToolHistory: resolved.contains { entry in
+                if case .tool = entry {
+                    return true
+                }
+                return false
+            }
+        )
+        let messages = try canonicalMessages(from: resolved, toolDirective: toolDirective)
         let schemaFingerprint = fingerprint(for: resolved.latestResponseFormat?._schema)
         let additionalContext = makeAdditionalContext(
             from: resolved,
             metadata: metadata,
             schemaFingerprint: schemaFingerprint
         )
-        let toolSpecs = toolPolicy == .disabled ? nil : buildToolSpecs(from: resolved.toolDefinitions)
+        let toolSpecs = toolPolicy == .disabled ? nil : buildToolSpecs(from: selectedToolDefinitions)
         let input = UserInput(chat: messages, tools: toolSpecs, additionalContext: additionalContext)
         let imageCount = messages.reduce(into: 0) { $0 += $1.images.count }
 
@@ -124,7 +144,8 @@ internal struct MLXTranscriptPlanner: OpenFoundationModelsExtra.RequestBuilder {
             assistantMessageCount: messages.filter { $0.role == .assistant }.count,
             toolMessageCount: messages.filter { $0.role == .tool }.count,
             imageCount: imageCount,
-            toolDefinitionCount: toolSpecs?.count ?? 0
+            toolDefinitionCount: toolSpecs?.count ?? 0,
+            latestUserPreview: previewText(latestPromptText)
         )
 
         return MLXExecutionPlan(
@@ -145,7 +166,7 @@ internal struct MLXTranscriptPlanner: OpenFoundationModelsExtra.RequestBuilder {
         metadata: MLXModelMetadata
     ) throws -> MLXWarmupPlan? {
         let resolved = transcript.resolved()
-        let messages = try canonicalMessages(from: resolved)
+        let messages = try canonicalMessages(from: resolved, toolDirective: nil)
         let imageCount = messages.reduce(into: 0) { $0 += $1.images.count }
         guard imageCount == 0, !messages.isEmpty else {
             return nil
@@ -179,7 +200,10 @@ internal struct MLXTranscriptPlanner: OpenFoundationModelsExtra.RequestBuilder {
         )
     }
 
-    private func canonicalMessages(from resolved: ResolvedTranscript) throws -> [Chat.Message] {
+    private func canonicalMessages(
+        from resolved: ResolvedTranscript,
+        toolDirective: String?
+    ) throws -> [Chat.Message] {
         var imageSegments: [Transcript.ImageSegment] = []
         for entry in resolved {
             if case .prompt(let prompt) = entry {
@@ -241,12 +265,25 @@ internal struct MLXTranscriptPlanner: OpenFoundationModelsExtra.RequestBuilder {
 
         if !systemMessages.isEmpty {
             var content = systemMessages.joined(separator: "\n\n")
+            if let toolDirective, !toolDirective.isEmpty {
+                content += "\n\n\(toolDirective)"
+            }
             if let schemaJSON {
                 content += "\n\nRespond with JSON matching this schema:\n\(schemaJSON)"
             }
             messages.append(.system(content))
-        } else if let schemaJSON {
-            messages.append(.system("Respond with JSON matching this schema:\n\(schemaJSON)"))
+        } else if toolDirective != nil || schemaJSON != nil {
+            var content = ""
+            if let toolDirective, !toolDirective.isEmpty {
+                content += toolDirective
+            }
+            if let schemaJSON {
+                if !content.isEmpty {
+                    content += "\n\n"
+                }
+                content += "Respond with JSON matching this schema:\n\(schemaJSON)"
+            }
+            messages.append(.system(content))
         }
 
         let nonSystem = rawMessages.filter { $0.type != .system }
@@ -290,12 +327,7 @@ internal struct MLXTranscriptPlanner: OpenFoundationModelsExtra.RequestBuilder {
             return .required
         }
 
-        let latestPromptText = resolved.reversed().compactMap { entry -> String? in
-            guard case .prompt(let prompt) = entry else {
-                return nil
-            }
-            return segmentsToText(prompt.segments)
-        }.first?.lowercased() ?? ""
+        let latestPromptText = latestPromptText(from: resolved)
 
         if toolInteractions.isEmpty, isPlainConversation(text: latestPromptText) {
             return .disabled
@@ -303,6 +335,10 @@ internal struct MLXTranscriptPlanner: OpenFoundationModelsExtra.RequestBuilder {
 
         if metadata.prefersConservativeToolUse && isPlainConversation(text: latestPromptText) {
             return .disabled
+        }
+
+        if requiresToolBeforeAnswer(text: latestPromptText, availableTools: resolved.toolDefinitions) {
+            return .required
         }
 
         if isToolOrientedRequest(text: latestPromptText) || !toolInteractions.isEmpty {
@@ -349,6 +385,16 @@ internal struct MLXTranscriptPlanner: OpenFoundationModelsExtra.RequestBuilder {
         let prefixMessages = Array(messages[..<lastUserIndex])
         let suffixMessages = Array(messages[lastUserIndex...])
         guard !prefixMessages.isEmpty else {
+            return MLXCachePlan(
+                reuseScope: .none,
+                cacheKey: nil,
+                prefixMessages: prefixMessages,
+                suffixMessages: suffixMessages,
+                prefixInput: nil
+            )
+        }
+
+        guard supportsStandalonePrefixInput(prefixMessages) else {
             return MLXCachePlan(
                 reuseScope: .none,
                 cacheKey: nil,
@@ -540,9 +586,90 @@ internal struct MLXTranscriptPlanner: OpenFoundationModelsExtra.RequestBuilder {
         let keywords = [
             "file", "files", "code", "repo", "repository", "git", "commit", "search", "find",
             "run", "execute", "edit", "patch", "write", "open", "fetch", "inspect",
+            "location", "weather", "route", "map", "nearby",
             "実行", "編集", "修正", "検索", "調査", "確認", "ファイル", "コード", "コミット",
+            "現在地", "位置", "場所", "天気", "地図", "近く", "周辺", "経路",
         ]
         return keywords.contains(where: { text.contains($0) })
+    }
+
+    private func requiresToolBeforeAnswer(
+        text: String,
+        availableTools _: [Transcript.ToolDefinition]
+    ) -> Bool {
+        let requiredKeywords = [
+            "current location", "where am i", "my location", "near me", "nearby",
+            "weather", "route", "eta", "contact", "notification",
+            "現在地", "今いる場所", "自分の位置", "近く", "周辺", "天気", "経路", "到着", "連絡先", "通知",
+        ]
+        return requiredKeywords.contains(where: { text.contains($0) })
+    }
+
+    private func toolDirective(
+        latestPromptText: String,
+        toolPolicy: MLXToolPolicy,
+        availableTools: [Transcript.ToolDefinition]
+    ) -> String? {
+        guard toolPolicy == .required
+            || requiresToolBeforeAnswer(text: latestPromptText, availableTools: availableTools)
+        else {
+            return nil
+        }
+
+        return """
+        This request requires a tool call before answering. Do not answer from memory or with a generic greeting. If a matching tool is available, call it first and then answer using the tool result.
+        """
+    }
+
+    private func selectToolDefinitions(
+        from toolDefinitions: [Transcript.ToolDefinition],
+        latestPromptText _: String,
+        toolPolicy _: MLXToolPolicy,
+        hasToolHistory _: Bool
+    ) -> [Transcript.ToolDefinition] {
+        toolDefinitions
+    }
+
+    private func latestPromptText(from resolved: ResolvedTranscript) -> String {
+        resolved.reversed().compactMap { entry -> String? in
+            guard case .prompt(let prompt) = entry else {
+                return nil
+            }
+            return segmentsToText(prompt.segments).lowercased()
+        }.first ?? ""
+    }
+
+    private func previewText(_ text: String) -> String {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.count > 80 else {
+            return trimmed
+        }
+        let index = trimmed.index(trimmed.startIndex, offsetBy: 80)
+        return String(trimmed[..<index]) + "..."
+    }
+
+    private func supportsStandalonePrefixInput(_ messages: [Chat.Message]) -> Bool {
+        var sawUserQuery = false
+
+        for message in messages {
+            guard message.role == .user else {
+                continue
+            }
+
+            let trimmed = message.content.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed.isEmpty {
+                continue
+            }
+
+            if trimmed.hasPrefix("<tool_response>"), trimmed.hasSuffix("</tool_response>") {
+                continue
+            }
+
+            sawUserQuery = true
+            break
+        }
+
+        return sawUserQuery
     }
 }
 
