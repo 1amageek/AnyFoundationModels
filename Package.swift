@@ -4,10 +4,10 @@ import PackageDescription
 let package = Package(
     name: "AnyFoundationModels",
     platforms: [
-        .macOS(.v15),
-        .iOS(.v18),
-        .macCatalyst(.v18),
-        .visionOS(.v2)
+        .macOS(.v26),
+        .iOS(.v26),
+        .macCatalyst(.v26),
+        .visionOS(.v26)
     ],
     products: [
         // Backends
@@ -15,12 +15,14 @@ let package = Package(
         .library(name: "ClaudeFoundationModels", targets: ["ClaudeFoundationModels"]),
         .library(name: "ResponseFoundationModels", targets: ["ResponseFoundationModels"]),
         .library(name: "MLXFoundationModels", targets: ["MLXFoundationModels"]),
+        .library(name: "MetalFoundationModels", targets: ["MetalFoundationModels"]),
     ],
     traits: [
         .trait(name: "Ollama"),
         .trait(name: "Claude"),
         .trait(name: "Response"),
         .trait(name: "MLX"),
+        .trait(name: "Metal"),
         .default(enabledTraits: []),
     ],
     dependencies: [
@@ -28,9 +30,14 @@ let package = Package(
         .package(url: "https://github.com/1amageek/OpenFoundationModels.git", from: "1.10.0"),
         // Claude
         .package(url: "https://github.com/apple/swift-configuration.git", from: "1.0.0"),
+        // Metal
+        .package(url: "https://github.com/1amageek/swift-lm.git", exact: "0.1.0"),
         // MLX
-        .package(path: "../mlx-swift-lm"),
-        .package(url: "https://github.com/huggingface/swift-transformers", from: "1.1.6"),
+        .package(url: "https://github.com/ml-explore/mlx-swift-lm.git", from: "2.31.3"),
+        .package(
+            url: "https://github.com/huggingface/swift-transformers",
+            .upToNextMinor(from: "1.2.0")
+        ),
     ],
     targets: [
         // ===== Backend Targets =====
@@ -97,6 +104,22 @@ let package = Package(
             ]
         ),
 
+        .target(
+            name: "MetalFoundationModels",
+            dependencies: [
+                .product(name: "OpenFoundationModels", package: "OpenFoundationModels",
+                         condition: .when(traits: ["Metal"])),
+                .product(name: "OpenFoundationModelsExtra", package: "OpenFoundationModels",
+                         condition: .when(traits: ["Metal"])),
+                .product(name: "SwiftLM", package: "swift-lm",
+                         condition: .when(traits: ["Metal"])),
+            ],
+            swiftSettings: [
+                .swiftLanguageMode(.v6),
+                .define("METAL_ENABLED", .when(traits: ["Metal"])),
+            ]
+        ),
+
         // ===== Tests =====
         .testTarget(
             name: "OllamaFoundationModelsTests",
@@ -152,9 +175,6 @@ let package = Package(
                          condition: .when(traits: ["MLX"])),
                 .product(name: "MLXLMCommon", package: "mlx-swift-lm",
                          condition: .when(traits: ["MLX"])),
-            ],
-            resources: [
-                .copy("Fixtures"),
             ],
             swiftSettings: [
                 .swiftLanguageMode(.v6),

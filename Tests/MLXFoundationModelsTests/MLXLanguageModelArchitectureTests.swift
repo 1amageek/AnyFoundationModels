@@ -1,259 +1,167 @@
 #if MLX_ENABLED
 import Foundation
+import MLXLMCommon
 import OpenFoundationModels
 import OpenFoundationModelsCore
-import MLXLMCommon
 import Testing
 @testable import MLXFoundationModels
 
-@Suite("MLXLanguageModel Architecture Tests")
-struct MLXLanguageModelArchitectureTests {
-    private let planner = MLXTranscriptPlanner()
-    private let tuner = MLXGenerationTuner()
-    private let assembler = MLXResponseAssembler()
+// MARK: - MLXRequestConverter Tests
 
-    @Test("Planner omits tools for plain conversational turns")
-    func plannerOmitsToolsForPlainConversation() throws {
-        let transcript = Transcript(entries: [
-            .instructions(.init(segments: [.text(.init(content: "You are helpful."))], toolDefinitions: [searchToolDefinition()])),
-            .prompt(.init(segments: [.text(.init(content: "こんにちは"))])),
-        ])
+@Suite("MLXRequestConverter Tests")
+struct MLXRequestConverterTests {
+    private let converter = MLXRequestConverter()
 
-        let plan = try planner.plan(
-            transcript: transcript,
-            options: nil,
-            metadata: denseSmallMetadata()
-        )
-
-        #expect(plan.toolPolicy == .disabled)
-        #expect(plan.responseMode == .text)
-        #expect(plan.plannerDiagnostics.toolDefinitionCount == 0)
-        #expect(plan.cachePlan.reuseScope == .none)
-        #expect(plan.cachePlan.prefixInput == nil)
-    }
-
-    @Test("Planner only reuses prefixes that contain a standalone user query")
-    func plannerReusesStandalonePrefixAfterAssistantTurn() throws {
+    @Test("Plain text produces system + user messages")
+    func plainTextConversation() throws {
         let transcript = Transcript(entries: [
             .instructions(.init(segments: [.text(.init(content: "You are helpful."))], toolDefinitions: [])),
-            .prompt(.init(segments: [.text(.init(content: "こんにちは"))])),
-            .response(.init(assetIDs: [], segments: [.text(.init(content: "こんにちは。"))])),
-            .prompt(.init(segments: [.text(.init(content: "続けて"))])),
-        ])
-
-        let plan = try planner.plan(
-            transcript: transcript,
-            options: nil,
-            metadata: denseSmallMetadata()
-        )
-
-        #expect(plan.cachePlan.reuseScope == MLXCacheReuseScope.prefixReusable)
-        #expect(plan.cachePlan.prefixInput != nil)
-    }
-
-    @Test("Planner enables tools for non-small-talk requests even without keyword matches")
-    func plannerEnablesToolsForPracticalJapaneseRequest() throws {
-        let transcript = Transcript(entries: [
-            .instructions(.init(segments: [.text(.init(content: "Use tools when needed."))], toolDefinitions: [searchToolDefinition()])),
-            .prompt(.init(segments: [.text(.init(content: "東京の天気を教えて"))])),
-        ])
-
-        let plan = try planner.plan(
-            transcript: transcript,
-            options: nil,
-            metadata: denseSmallMetadata()
-        )
-
-        #expect(plan.toolPolicy == .required)
-        #expect(plan.responseMode == .toolCapable)
-        #expect(plan.plannerDiagnostics.toolDefinitionCount == 1)
-        #expect(plan.plannerDiagnostics.latestUserPreview == "東京の天気を教えて")
-        #expect(plan.input.prompt.description.contains("This request requires a tool call before answering."))
-    }
-
-    @Test("Planner requires tools when continuing an unresolved tool loop")
-    func plannerRequiresToolsForPendingToolLoop() throws {
-        let callArguments = try GeneratedContent(json: #"{"query":"TODO"}"#)
-        let transcript = Transcript(entries: [
-            .instructions(.init(segments: [.text(.init(content: "Use tools when needed."))], toolDefinitions: [searchToolDefinition()])),
-            .prompt(.init(segments: [.text(.init(content: "Search the repository for TODOs"))])),
-            .toolCalls(.init([
-                Transcript.ToolCall(
-                    id: "call-1",
-                    toolName: "search_repo",
-                    arguments: callArguments
-                )
-            ])),
-        ])
-
-        let plan = try planner.plan(
-            transcript: transcript,
-            options: nil,
-            metadata: denseMidMetadata()
-        )
-
-        #expect(plan.toolPolicy == .required)
-        #expect(plan.responseMode == .toolCapable)
-        #expect(plan.plannerDiagnostics.toolDefinitionCount == 1)
-    }
-
-    @Test("Planner requires tools for current location requests")
-    func plannerRequiresToolsForCurrentLocationRequest() throws {
-        let transcript = Transcript(entries: [
-            .instructions(.init(segments: [.text(.init(content: "Use tools when needed."))], toolDefinitions: [searchToolDefinition()])),
-            .prompt(.init(segments: [.text(.init(content: "現在地を教えてください"))])),
-        ])
-
-        let plan = try planner.plan(
-            transcript: transcript,
-            options: nil,
-            metadata: denseSmallMetadata()
-        )
-
-        #expect(plan.toolPolicy == .required)
-        #expect(plan.input.prompt.description.contains("Do not answer from memory"))
-    }
-
-    @Test("Planner cache key changes when schema changes")
-    func plannerCacheKeyChangesWhenSchemaChanges() throws {
-        let baseEntries: [Transcript.Entry] = [
-            .instructions(.init(segments: [.text(.init(content: "Return structured data."))], toolDefinitions: [])),
             .prompt(.init(segments: [.text(.init(content: "Hello"))])),
-            .response(.init(assetIDs: [], segments: [.text(.init(content: "Hi"))])),
-        ]
+        ])
 
-        let stringTranscript = Transcript(entries: baseEntries + [
+        let result = try converter.convert(transcript: transcript, metadata: llmMetadata())
+
+        #expect(!result.hasTools)
+        #expect(!result.hasSchema)
+        let chat = extractChat(from: result.input)
+        #expect(chat.count == 2)
+        #expect(chat[0].role == .system)
+        #expect(chat[0].content == "You are helpful.")
+        #expect(chat[1].role == .user)
+        #expect(chat[1].content == "Hello")
+        #expect(result.input.tools == nil)
+    }
+
+    @Test("Tool definitions produce tool specs and hasTools=true")
+    func toolDefinitionsPresent() throws {
+        let transcript = Transcript(entries: [
+            .instructions(.init(segments: [.text(.init(content: "Use tools."))], toolDefinitions: [searchToolDefinition()])),
+            .prompt(.init(segments: [.text(.init(content: "Search for TODOs"))])),
+        ])
+
+        let result = try converter.convert(transcript: transcript, metadata: llmMetadata())
+
+        #expect(result.hasTools)
+        #expect(!result.hasSchema)
+        #expect(result.input.tools != nil)
+        #expect(result.input.tools?.count == 1)
+    }
+
+    @Test("Multi-turn with tool interaction produces correct message order")
+    func multiTurnWithToolInteraction() throws {
+        let callArguments = try GeneratedContent(json: #"{"query":"swift"}"#)
+        let transcript = Transcript(entries: [
+            .instructions(.init(segments: [.text(.init(content: "You are helpful."))], toolDefinitions: [searchToolDefinition()])),
+            .prompt(.init(segments: [.text(.init(content: "Search for swift"))])),
+            .toolCalls(.init([
+                Transcript.ToolCall(id: "call-1", toolName: "search_repo", arguments: callArguments),
+            ])),
+            .toolOutput(.init(id: "call-1", toolName: "search_repo", segments: [.text(.init(content: "Found 3 results"))])),
+            .prompt(.init(segments: [.text(.init(content: "Tell me more"))])),
+        ])
+
+        let result = try converter.convert(transcript: transcript, metadata: llmMetadata())
+
+        // system, user, assistant (tool call text), tool (output), user
+        let chat = extractChat(from: result.input)
+        #expect(chat.count == 5)
+        #expect(chat[0].role == .system)
+        #expect(chat[1].role == .user)
+        #expect(chat[2].role == .assistant)
+        #expect(chat[3].role == .tool)
+        #expect(chat[3].content == "Found 3 results")
+        #expect(chat[4].role == .user)
+        #expect(chat[4].content == "Tell me more")
+    }
+
+    @Test("Schema appended to system message with hasSchema=true")
+    func schemaInResponseFormat() throws {
+        let transcript = Transcript(entries: [
+            .instructions(.init(segments: [.text(.init(content: "Return data."))], toolDefinitions: [])),
             .prompt(
                 .init(
-                    segments: [.text(.init(content: "Summarize this"))],
+                    segments: [.text(.init(content: "Summarize"))],
                     responseFormat: .init(schema: GenerationSchema(type: String.self, description: "A summary", properties: []))
                 )
             ),
         ])
 
-        let intTranscript = Transcript(entries: baseEntries + [
-            .prompt(
-                .init(
-                    segments: [.text(.init(content: "Summarize this"))],
-                    responseFormat: .init(schema: GenerationSchema(type: Int.self, description: "A count", properties: []))
-                )
-            ),
+        let result = try converter.convert(transcript: transcript, metadata: llmMetadata())
+
+        #expect(!result.hasTools)
+        #expect(result.hasSchema)
+        let chat = extractChat(from: result.input)
+        #expect(chat[0].role == .system)
+        #expect(chat[0].content.contains("Respond with JSON matching this schema:"))
+    }
+
+    @Test("Qwen metadata sets enable_thinking=false in additionalContext")
+    func qwenThinkingDisabled() throws {
+        let transcript = Transcript(entries: [
+            .prompt(.init(segments: [.text(.init(content: "Hello"))])),
         ])
 
-        let metadata = denseMidMetadata()
-        let stringPlan = try planner.plan(transcript: stringTranscript, options: nil, metadata: metadata)
-        let intPlan = try planner.plan(transcript: intTranscript, options: nil, metadata: metadata)
+        let metadata = MLXModelMetadata(modelID: "mlx-community/Qwen3.5-4B", runtimeFamily: .llm)
+        let result = try converter.convert(transcript: transcript, metadata: metadata)
 
-        #expect(stringPlan.cachePlan.cacheKey != nil)
-        #expect(intPlan.cachePlan.cacheKey != nil)
-        #expect(stringPlan.cachePlan.cacheKey != intPlan.cachePlan.cacheKey)
-        #expect(stringPlan.schemaFingerprint != intPlan.schemaFingerprint)
+        #expect(result.input.additionalContext?["enable_thinking"] as? Bool == false)
     }
 
-    @Test("Tuner applies prompt length thresholds and VLM cap")
-    func tunerAppliesPromptLengthThresholds() {
-        let plan = makePlan(responseMode: .text, toolPolicy: .disabled)
+    @Test("Non-Qwen metadata has no enable_thinking key")
+    func nonQwenNoThinkingKey() throws {
+        let transcript = Transcript(entries: [
+            .prompt(.init(segments: [.text(.init(content: "Hello"))])),
+        ])
 
-        let shortProfile = tuner.makeProfile(
-            plan: plan,
-            metadata: denseMidMetadata(),
-            promptTokenCount: 1024
-        )
-        #expect(shortProfile.prefillStepSize == 512)
-        #expect(shortProfile.kvBits == nil)
-        #expect(shortProfile.maxKVSize == nil)
+        let metadata = MLXModelMetadata(modelID: "mlx-community/Llama-3B", runtimeFamily: .llm)
+        let result = try converter.convert(transcript: transcript, metadata: metadata)
 
-        let midProfile = tuner.makeProfile(
-            plan: plan,
-            metadata: denseMidMetadata(),
-            promptTokenCount: 4096
-        )
-        #expect(midProfile.prefillStepSize == 1024)
-        #expect(midProfile.kvBits == nil)
+        #expect(result.input.additionalContext?["enable_thinking"] == nil)
+    }
+}
 
-        let longProfile = tuner.makeProfile(
-            plan: plan,
-            metadata: denseMidMetadata(),
-            promptTokenCount: 9000
-        )
-        #expect(longProfile.prefillStepSize == 1536)
-        #expect(longProfile.kvBits == 4)
-        #expect(longProfile.quantizedKVStart == 4096)
+// MARK: - MLXResponseConverter Tests
 
-        let vlmProfile = tuner.makeProfile(
-            plan: plan,
-            metadata: vlmMetadata(),
-            promptTokenCount: 9000
+@Suite("MLXResponseConverter Tests")
+struct MLXResponseConverterTests {
+    private let converter = MLXResponseConverter()
+
+    @Test("Plain text response")
+    func plainTextResponse() throws {
+        let entry = try converter.finalEntry(
+            from: [.chunk("Hello world"), .info(dummyInfo())],
+            hasTools: false,
+            hasSchema: false
         )
-        #expect(vlmProfile.prefillStepSize == 1024)
-        #expect(vlmProfile.kvBits == 4)
+
+        #expect(extractText(from: entry) == "Hello world")
     }
 
-    @Test("Prefix reuse validator rejects mismatched prefix snapshots")
-    func prefixReuseValidatorRejectsMismatchedPrefix() {
-        let result = MLXPrefixReuseValidator.validate(
-            fullTokens: [1, 2, 3, 4],
-            prefixTokens: [1, 9],
-            requestedPrefixTokenCount: 2,
-            successOutcome: "hit"
-        )
-
-        #expect(result.acceptedPrefixTokenCount == nil)
-        #expect(result.outcome == MLXCacheInvalidationReason.prefixSnapshotMismatch.rawValue)
-        #expect(result.shouldInvalidate)
-    }
-
-    @Test("Prefix reuse validator clamps reused token count to actual prefix length")
-    func prefixReuseValidatorClampsToActualPrefixLength() {
-        let result = MLXPrefixReuseValidator.validate(
-            fullTokens: [1, 2, 3, 4, 5],
-            prefixTokens: [1, 2, 3],
-            requestedPrefixTokenCount: 4,
-            successOutcome: "built"
-        )
-
-        #expect(result.acceptedPrefixTokenCount == 3)
-        #expect(result.outcome == "built")
-        #expect(!result.shouldInvalidate)
-    }
-
-    @Test("Prefix reuse validator rejects prefixes that consume the full prompt")
-    func prefixReuseValidatorRejectsFullPromptPrefixes() {
-        let result = MLXPrefixReuseValidator.validate(
-            fullTokens: [1, 2, 3],
-            prefixTokens: [1, 2, 3],
-            requestedPrefixTokenCount: 3,
-            successOutcome: "hit"
-        )
-
-        #expect(result.acceptedPrefixTokenCount == nil)
-        #expect(result.outcome == MLXCacheInvalidationReason.prefixSnapshotMismatch.rawValue)
-        #expect(result.shouldInvalidate)
-    }
-
-    @Test("Assembler strips think blocks from final text responses")
-    func assemblerStripsThinkBlocks() throws {
-        let entry = try assembler.finalEntry(
-            plan: makePlan(responseMode: .text, toolPolicy: .disabled),
-            events: [
-                .textChunk("<think>secret reasoning</think>\nHello"),
-                .textChunk("</think>\nWorld"),
-                .completed,
-            ]
+    @Test("Think block stripping in final entry")
+    func thinkBlockStripping() throws {
+        let entry = try converter.finalEntry(
+            from: [
+                .chunk("<think>reasoning</think>\nHello"),
+                .chunk("</think>\nWorld"),
+                .info(dummyInfo()),
+            ],
+            hasTools: false,
+            hasSchema: false
         )
 
         #expect(extractText(from: entry) == "Hello\nWorld")
     }
 
-    @Test("Assembler prefers native tool calls over textual fallback")
-    func assemblerPrefersNativeToolCalls() throws {
-        let entry = try assembler.finalEntry(
-            plan: makePlan(responseMode: .toolCapable, toolPolicy: .enabled),
-            events: [
-                .textChunk(#"{"tool_calls":[{"name":"search_repo","arguments":{"query":"fallback"}}]}"#),
-                .nativeToolCall(name: "search_repo", argsJSON: #"{"query":"native"}"#),
-                .completed,
-            ]
+    @Test("Native tool calls take priority over textual detection")
+    func nativeToolCallPriority() throws {
+        let entry = try converter.finalEntry(
+            from: [
+                .chunk(#"{"tool_calls":[{"name":"search_repo","arguments":{"query":"fallback"}}]}"#),
+                .toolCall(ToolCall(function: .init(name: "search_repo", arguments: ["query": "native"]))),
+                .info(dummyInfo()),
+            ],
+            hasTools: true,
+            hasSchema: false
         )
 
         guard case .toolCalls(let calls) = entry else {
@@ -267,14 +175,15 @@ struct MLXLanguageModelArchitectureTests {
         #expect(query == "native")
     }
 
-    @Test("Assembler falls back to textual tool call detection")
-    func assemblerFallsBackToTextualToolCallDetection() throws {
-        let entry = try assembler.finalEntry(
-            plan: makePlan(responseMode: .toolCapable, toolPolicy: .enabled),
-            events: [
-                .textChunk(#"{"tool_calls":[{"name":"search_repo","arguments":{"query":"swift"}}]}"#),
-                .completed,
-            ]
+    @Test("Textual JSON tool call fallback")
+    func textualJSONToolCallFallback() throws {
+        let entry = try converter.finalEntry(
+            from: [
+                .chunk(#"{"tool_calls":[{"name":"search_repo","arguments":{"query":"swift"}}]}"#),
+                .info(dummyInfo()),
+            ],
+            hasTools: true,
+            hasSchema: false
         )
 
         guard case .toolCalls(let calls) = entry else {
@@ -287,99 +196,135 @@ struct MLXLanguageModelArchitectureTests {
         #expect(query == "swift")
     }
 
-    @Test("Assembler rejects empty required-tool completions")
-    func assemblerRejectsEmptyRequiredToolCompletion() throws {
-        #expect(throws: MLXResponseAssemblyError.self) {
-            try assembler.validate(
-                plan: makePlan(responseMode: .toolCapable, toolPolicy: .required),
-                events: [.info, .completed]
-            )
+    @Test("Textual XML tool call fallback (Qwen style)")
+    func textualXMLToolCallFallback() throws {
+        let entry = try converter.finalEntry(
+            from: [
+                .chunk("""
+                    <tool_call>
+                    <function=location_get_current>
+                    </function>
+                    </tool_call>
+                    """),
+                .info(dummyInfo()),
+            ],
+            hasTools: true,
+            hasSchema: false
+        )
+
+        guard case .toolCalls(let calls) = entry else {
+            Issue.record("Expected XML textual tool call detection")
+            return
+        }
+
+        #expect(calls.count == 1)
+        #expect(calls.first?.toolName == "location_get_current")
+    }
+
+    @Test("Textual tool call not detected when hasTools=false")
+    func noToolDetectionWithoutTools() throws {
+        let entry = try converter.finalEntry(
+            from: [
+                .chunk(#"{"tool_calls":[{"name":"search_repo","arguments":{"query":"test"}}]}"#),
+                .info(dummyInfo()),
+            ],
+            hasTools: false,
+            hasSchema: false
+        )
+
+        guard case .response = entry else {
+            Issue.record("Expected text response when hasTools=false")
+            return
         }
     }
 
-    @Test("Streaming sanitizer never emits think content")
-    func streamingSanitizerSuppressesThinkBlocks() {
-        var state = MLXStreamingResponseState()
-        let firstResult = assembler.streamDelta(state: state, chunk: "<think>secret")
-        state = firstResult.state
-        let secondResult = assembler.streamDelta(state: state, chunk: "</think>Hello")
+    @Test("Streaming delta suppresses think blocks")
+    func streamingThinkBlockSuppression() {
+        var state = MLXResponseConverter.StreamingState()
+        let firstDelta = converter.streamDelta(state: &state, chunk: "<think>secret")
+        let secondDelta = converter.streamDelta(state: &state, chunk: "</think>Hello")
 
-        #expect(firstResult.delta.isEmpty)
-        #expect(secondResult.delta == "Hello")
-        #expect(!secondResult.state.emittedVisibleText.contains("secret"))
+        #expect(firstDelta.isEmpty)
+        #expect(secondDelta == "Hello")
+        #expect(!state.emittedVisibleText.contains("secret"))
+    }
+
+    @Test("Code fence stripping")
+    func codeFenceStripping() throws {
+        let entry = try converter.finalEntry(
+            from: [
+                .chunk("```json\n{\"key\": \"value\"}\n```"),
+                .info(dummyInfo()),
+            ],
+            hasTools: false,
+            hasSchema: false
+        )
+
+        #expect(extractText(from: entry) == "{\"key\": \"value\"}")
     }
 }
 
-private func makePlan(
-    responseMode: MLXResponseMode,
-    toolPolicy: MLXToolPolicy
-) -> MLXExecutionPlan {
-    let tools: [[String: any Sendable]]? = toolPolicy == .disabled ? nil : [[
-        "type": "function" as any Sendable,
-        "function": [
-            "name": "search_repo" as any Sendable,
-            "description": "Search files" as any Sendable,
-        ] as any Sendable,
-    ]]
+// MARK: - Parameter Computation Tests
 
-    return MLXExecutionPlan(
-        input: UserInput(
-            chat: [
-                .system("You are helpful."),
-                .user("Hello"),
-            ],
-            tools: tools,
-            additionalContext: [:]
-        ),
-        responseMode: responseMode,
-        toolPolicy: toolPolicy,
-        cachePlan: MLXCachePlan(
-            reuseScope: .prefixReusable,
-            cacheKey: MLXPrefixCacheKey(rawValue: "cache-key"),
-            prefixMessages: [.system("You are helpful.")],
-            suffixMessages: [.user("Hello")],
-            prefixInput: UserInput(chat: [.system("You are helpful.")], tools: tools, additionalContext: [:])
-        ),
-        promptTokenEstimate: nil,
-        schemaFingerprint: nil,
-        additionalContext: [:],
-        plannerDiagnostics: .init(
-            systemMessageCount: 1,
-            userMessageCount: 1,
-            assistantMessageCount: 0,
-            toolMessageCount: 0,
-            imageCount: 0,
-            toolDefinitionCount: tools?.count ?? 0,
-            latestUserPreview: "hello"
-        )
-    )
+@Suite("Parameter Computation Tests")
+struct ParameterComputationTests {
+
+    @Test("Short prompt uses prefillStepSize=512, no KV quantization")
+    func shortPromptParameters() {
+        let params = makeTestParameters(promptTokenCount: 1024, runtimeFamily: .llm)
+
+        #expect(params.prefillStepSize == 512)
+        #expect(params.kvBits == nil)
+        #expect(params.maxKVSize == nil)
+    }
+
+    @Test("Medium prompt uses prefillStepSize=1024")
+    func mediumPromptParameters() {
+        let params = makeTestParameters(promptTokenCount: 4096, runtimeFamily: .llm)
+
+        #expect(params.prefillStepSize == 1024)
+        #expect(params.kvBits == nil)
+    }
+
+    @Test("Long prompt uses prefillStepSize=1536 with KV quantization")
+    func longPromptParameters() {
+        let params = makeTestParameters(promptTokenCount: 9000, runtimeFamily: .llm)
+
+        #expect(params.prefillStepSize == 1536)
+        #expect(params.kvBits == 4)
+        #expect(params.quantizedKVStart == 4096)
+    }
+
+    @Test("VLM caps prefillStepSize at 1024")
+    func vlmPrefillCap() {
+        let params = makeTestParameters(promptTokenCount: 9000, runtimeFamily: .vlm)
+
+        #expect(params.prefillStepSize == 1024)
+        #expect(params.kvBits == 4)
+    }
 }
 
-private func denseSmallMetadata() -> MLXModelMetadata {
-    MLXModelMetadata(
-        modelID: "mlx-community/Qwen3.5-4B",
-        runtimeFamily: .llm,
-        modalityFamily: .text,
-        qwen35Variant: nil
-    )
+@Suite("MLX Metadata Registry Tests")
+struct MLXMetadataRegistryTests {
+
+    @Test("Metadata can be looked up by alias")
+    func metadataAliasLookup() async {
+        let modelID = "file:///tmp/\(UUID().uuidString)"
+        let alias = "mlx-community/\(UUID().uuidString)"
+        let metadata = MLXModelMetadata(modelID: modelID, runtimeFamily: .vlm)
+
+        await MLXModelMetadataRegistry.shared.register(metadata, aliases: [alias])
+
+        let resolved = await MLXModelMetadataRegistry.shared.metadata(for: alias)
+        #expect(resolved?.modelID == modelID)
+        #expect(resolved?.runtimeFamily == .vlm)
+    }
 }
 
-private func denseMidMetadata() -> MLXModelMetadata {
-    MLXModelMetadata(
-        modelID: "mlx-community/Qwen3.5-9B",
-        runtimeFamily: .llm,
-        modalityFamily: .text,
-        qwen35Variant: nil
-    )
-}
+// MARK: - Test Helpers
 
-private func vlmMetadata() -> MLXModelMetadata {
-    MLXModelMetadata(
-        modelID: "mlx-community/Qwen3.5-4B-MLX-4bit",
-        runtimeFamily: .vlm,
-        modalityFamily: .conditionalGeneration,
-        qwen35Variant: nil
-    )
+private func llmMetadata() -> MLXModelMetadata {
+    MLXModelMetadata(modelID: "mlx-community/Llama-3B", runtimeFamily: .llm)
 }
 
 private func searchToolDefinition() -> Transcript.ToolDefinition {
@@ -391,16 +336,66 @@ private func searchToolDefinition() -> Transcript.ToolDefinition {
 }
 
 private func extractText(from entry: Transcript.Entry) -> String? {
-    guard case .response(let response) = entry else {
-        return nil
-    }
-    guard response.segments.count == 1 else {
-        return nil
-    }
-    guard case .text(let text) = response.segments[0] else {
-        return nil
-    }
+    guard case .response(let response) = entry else { return nil }
+    guard response.segments.count == 1 else { return nil }
+    guard case .text(let text) = response.segments[0] else { return nil }
     return text.content
+}
+
+private func extractChat(from input: UserInput) -> [Chat.Message] {
+    switch input.prompt {
+    case .chat(let chat):
+        return chat
+    case .text(let text):
+        return [.user(text)]
+    case .messages:
+        Issue.record("Expected chat-form user input")
+        return []
+    }
+}
+
+private func dummyInfo() -> GenerateCompletionInfo {
+    GenerateCompletionInfo(
+        promptTokenCount: 10,
+        generationTokenCount: 5,
+        promptTime: 0.1,
+        generationTime: 0.2,
+        stopReason: .stop
+    )
+}
+
+/// Replicates the parameter computation logic from MLXLanguageModelRuntime
+/// for isolated testing without ModelContainer.
+private func makeTestParameters(
+    promptTokenCount: Int,
+    runtimeFamily: MLXRuntimeFamily,
+    options: GenerationOptions? = nil
+) -> GenerateParameters {
+    var prefillStepSize = 512
+    if promptTokenCount > 8192 {
+        prefillStepSize = 1536
+    } else if promptTokenCount > 2048 {
+        prefillStepSize = 1024
+    }
+    if runtimeFamily == .vlm {
+        prefillStepSize = min(prefillStepSize, 1024)
+    }
+
+    let kvBits: Int? = promptTokenCount > 8192 ? 4 : nil
+    let quantizedKVStart = kvBits == nil ? 0 : 4096
+
+    return GenerateParameters(
+        maxTokens: options?.maximumResponseTokens ?? 2048,
+        maxKVSize: nil,
+        kvBits: kvBits,
+        kvGroupSize: 64,
+        quantizedKVStart: quantizedKVStart,
+        temperature: options?.temperature.map { Float($0) } ?? 0,
+        topP: 0.9,
+        repetitionPenalty: 1.05,
+        repetitionContextSize: 64,
+        prefillStepSize: prefillStepSize
+    )
 }
 
 #endif

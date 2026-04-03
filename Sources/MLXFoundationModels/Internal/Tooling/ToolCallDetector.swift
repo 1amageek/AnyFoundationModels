@@ -109,6 +109,10 @@ enum ToolCallDetector {
             return entry
         }
 
+        if let entry = detectXMLFunctionCalls(text) {
+            return entry
+        }
+
         return detectBracketToolCalls(text)
     }
 
@@ -223,6 +227,125 @@ enum ToolCallDetector {
             Logger.warning("[ToolCallDetector] Individual tool call regex failed: \(error)")
             return nil
         }
+    }
+
+    private static func detectXMLFunctionCalls(_ text: String) -> Transcript.Entry? {
+        let cleaned = cleanText(text)
+        guard let regex = try? NSRegularExpression(
+            pattern: #"<function=([\s\S]*?)</function>"#,
+            options: [.caseInsensitive]
+        ) else {
+            return nil
+        }
+
+        let range = NSRange(cleaned.startIndex..<cleaned.endIndex, in: cleaned)
+        let matches = regex.matches(in: cleaned, options: [], range: range)
+        guard !matches.isEmpty else {
+            return nil
+        }
+
+        let calls: [Transcript.ToolCall] = matches.compactMap { match in
+            guard let matchRange = Range(match.range, in: cleaned) else {
+                return nil
+            }
+            return parseXMLFunctionCall(String(cleaned[matchRange]))
+        }
+
+        guard !calls.isEmpty else {
+            return nil
+        }
+
+        let toolCalls = Transcript.ToolCalls(id: UUID().uuidString, calls)
+        return .toolCalls(toolCalls)
+    }
+
+    private static func parseXMLFunctionCall(_ content: String) -> Transcript.ToolCall? {
+        guard let nameStart = content.range(of: "<function="),
+              let nameEnd = content.range(
+                of: ">",
+                range: nameStart.upperBound..<content.endIndex
+              )
+        else {
+            return nil
+        }
+
+        let functionName = String(content[nameStart.upperBound..<nameEnd.lowerBound])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !functionName.isEmpty else {
+            return nil
+        }
+
+        var arguments: [String: JSONValue] = [:]
+        let parameterSection = String(content[nameEnd.upperBound...])
+        var searchRange = parameterSection.startIndex..<parameterSection.endIndex
+
+        while let parameterStart = parameterSection.range(
+            of: "<parameter=",
+            range: searchRange
+        ) {
+            guard let parameterNameEnd = parameterSection.range(
+                of: ">",
+                range: parameterStart.upperBound..<parameterSection.endIndex
+            ),
+            let parameterEnd = parameterSection.range(
+                of: "</parameter>",
+                range: parameterNameEnd.upperBound..<parameterSection.endIndex
+            ) else {
+                break
+            }
+
+            let name = String(
+                parameterSection[parameterStart.upperBound..<parameterNameEnd.lowerBound]
+            ).trimmingCharacters(in: .whitespacesAndNewlines)
+            let rawValue = String(
+                parameterSection[parameterNameEnd.upperBound..<parameterEnd.lowerBound]
+            ).trimmingCharacters(in: .whitespacesAndNewlines)
+
+            if !name.isEmpty {
+                arguments[name] = parseXMLParameterValue(rawValue)
+            }
+
+            searchRange = parameterEnd.upperBound..<parameterSection.endIndex
+        }
+
+        do {
+            let generatedContent = try GeneratedContent(jsonValue: .object(arguments))
+            return Transcript.ToolCall(
+                id: UUID().uuidString,
+                toolName: functionName,
+                arguments: generatedContent
+            )
+        } catch {
+            return nil
+        }
+    }
+
+    private static func parseXMLParameterValue(_ rawValue: String) -> JSONValue {
+        let trimmed = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            return .string("")
+        }
+
+        if trimmed == "true" {
+            return .bool(true)
+        }
+        if trimmed == "false" {
+            return .bool(false)
+        }
+        if trimmed == "null" {
+            return .null
+        }
+        if let intValue = Int(trimmed) {
+            return .int(intValue)
+        }
+        if let doubleValue = Double(trimmed) {
+            return .double(doubleValue)
+        }
+        if let data = trimmed.data(using: .utf8),
+           let jsonValue = try? JSONDecoder().decode(JSONValue.self, from: data) {
+            return jsonValue
+        }
+        return .string(trimmed)
     }
 
     private static func parseIndividualToolCall(_ json: String) -> Transcript.ToolCall? {

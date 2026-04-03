@@ -1,8 +1,8 @@
 #if MLX_ENABLED
 import Foundation
 import CoreImage
-import OpenFoundationModels
 import MLXLMCommon
+import OpenFoundationModels
 
 package enum ImageSourceConverter {
 

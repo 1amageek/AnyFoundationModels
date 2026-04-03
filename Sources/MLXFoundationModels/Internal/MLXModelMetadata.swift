@@ -7,38 +7,25 @@ enum MLXRuntimeFamily: String, Sendable {
     case unknown
 }
 
-enum MLXModalityFamily: String, Sendable {
-    case text
-    case conditionalGeneration
-    case unknown
-}
-
 struct MLXModelMetadata: Sendable {
-    let modelID: String
-    let runtimeFamily: MLXRuntimeFamily
-    let modalityFamily: MLXModalityFamily
-    let qwen35Variant: Qwen35Variant?
-
-    var prefersThinkingDisabled: Bool {
-        qwen35Variant != nil || modelID.lowercased().contains("qwen")
+    enum ThinkingPreference: Sendable {
+        case enabled
+        case disabled
+        case unspecified
     }
 
-    var prefersConservativeToolUse: Bool {
-        if let variant = qwen35Variant {
-            return variant.parameterFamily == .denseSmall || variant.runtime == .vlm
-        }
+    let modelID: String
+    let runtimeFamily: MLXRuntimeFamily
 
-        let lowercased = modelID.lowercased()
-        return runtimeFamily == .vlm || lowercased.contains("2b") || lowercased.contains("4b")
+    var thinkingPreference: ThinkingPreference {
+        if modelID.lowercased().contains("qwen") {
+            return .disabled
+        }
+        return .unspecified
     }
 
     static func fallback(modelID: String) -> Self {
-        Self(
-            modelID: modelID,
-            runtimeFamily: .unknown,
-            modalityFamily: .unknown,
-            qwen35Variant: nil
-        )
+        Self(modelID: modelID, runtimeFamily: .unknown)
     }
 }
 
@@ -47,8 +34,11 @@ actor MLXModelMetadataRegistry {
 
     private var metadataByModelID: [String: MLXModelMetadata] = [:]
 
-    func register(_ metadata: MLXModelMetadata) {
+    func register(_ metadata: MLXModelMetadata, aliases: [String] = []) {
         metadataByModelID[metadata.modelID] = metadata
+        for alias in aliases where !alias.isEmpty {
+            metadataByModelID[alias] = metadata
+        }
     }
 
     func metadata(for modelID: String) -> MLXModelMetadata? {
