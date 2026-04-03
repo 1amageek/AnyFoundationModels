@@ -5,13 +5,13 @@ import OpenFoundationModels
 
 actor MLXLanguageModelRuntime {
     private let modelContainer: ModelContainer
+    private let profile: MLXModelProfile
     private let requestConverter = MLXRequestConverter()
     private let responseConverter = MLXResponseConverter()
 
-    private var metadata: MLXModelMetadata?
-
-    init(modelContainer: ModelContainer) {
-        self.modelContainer = modelContainer
+    init(loadedModel: MLXLoadedModel) {
+        self.modelContainer = loadedModel.container
+        self.profile = loadedModel.profile
     }
 
     // MARK: - Non-Streaming Generation
@@ -20,8 +20,7 @@ actor MLXLanguageModelRuntime {
         transcript: Transcript,
         options: GenerationOptions?
     ) async throws -> Transcript.Entry {
-        let metadata = await resolveMetadata()
-        let request = try requestConverter.convert(transcript: transcript, metadata: metadata)
+        let request = try requestConverter.convert(transcript: transcript, profile: profile)
         let hasTools = request.hasTools
         let hasSchema = request.hasSchema
         let lmInput = try await modelContainer.prepare(input: request.input)
@@ -29,12 +28,12 @@ actor MLXLanguageModelRuntime {
         let parameters = makeParameters(
             options: options,
             promptTokenCount: promptTokenCount,
-            metadata: metadata
+            profile: profile
         )
 
         #if DEBUG
         logRequest(
-            metadata: metadata,
+            profile: profile,
             hasTools: hasTools,
             hasSchema: hasSchema,
             promptTokenCount: promptTokenCount,
@@ -68,10 +67,9 @@ actor MLXLanguageModelRuntime {
         AsyncThrowingStream { continuation in
             let task = Task {
                 do {
-                    let metadata = await self.resolveMetadata()
                     let request = try self.requestConverter.convert(
                         transcript: transcript,
-                        metadata: metadata
+                        profile: self.profile
                     )
                     let hasTools = request.hasTools
                     let hasSchema = request.hasSchema
@@ -80,12 +78,12 @@ actor MLXLanguageModelRuntime {
                     let parameters = self.makeParameters(
                         options: options,
                         promptTokenCount: promptTokenCount,
-                        metadata: metadata
+                        profile: self.profile
                     )
 
                     #if DEBUG
                     self.logRequest(
-                        metadata: metadata,
+                        profile: self.profile,
                         hasTools: hasTools,
                         hasSchema: hasSchema,
                         promptTokenCount: promptTokenCount,
@@ -168,27 +166,12 @@ actor MLXLanguageModelRuntime {
         }
     }
 
-    // MARK: - Metadata Resolution
-
-    private func resolveMetadata() async -> MLXModelMetadata {
-        if let metadata {
-            return metadata
-        }
-
-        let configuration = await modelContainer.configuration
-        let modelID = configuration.name
-        let resolved = await MLXModelMetadataRegistry.shared.metadata(for: modelID)
-            ?? .fallback(modelID: modelID)
-        metadata = resolved
-        return resolved
-    }
-
     // MARK: - Parameter Computation
 
     private func makeParameters(
         options: GenerationOptions?,
         promptTokenCount: Int,
-        metadata: MLXModelMetadata
+        profile: MLXModelProfile
     ) -> GenerateParameters {
         // Prefill step size scales with prompt length
         var prefillStepSize = 512
@@ -198,7 +181,7 @@ actor MLXLanguageModelRuntime {
             prefillStepSize = 1024
         }
         // VLM cap
-        if metadata.runtimeFamily == .vlm {
+        if profile.runtimeFamily == .vlm {
             prefillStepSize = min(prefillStepSize, 1024)
         }
 
@@ -224,14 +207,14 @@ actor MLXLanguageModelRuntime {
 
     #if DEBUG
     private func logRequest(
-        metadata: MLXModelMetadata,
+        profile: MLXModelProfile,
         hasTools: Bool,
         hasSchema: Bool,
         promptTokenCount: Int,
         parameters: GenerateParameters
     ) {
         print(
-            "[MLXLanguageModel] generate modelID=\(metadata.modelID) runtime=\(metadata.runtimeFamily.rawValue) hasTools=\(hasTools) hasSchema=\(hasSchema) promptTokens=\(promptTokenCount) prefillStep=\(parameters.prefillStepSize) kvBits=\(String(describing: parameters.kvBits))"
+            "[MLXLanguageModel] generate modelID=\(profile.modelID) runtime=\(profile.runtimeFamily.rawValue) hasTools=\(hasTools) hasSchema=\(hasSchema) promptTokens=\(promptTokenCount) prefillStep=\(parameters.prefillStepSize) kvBits=\(String(describing: parameters.kvBits))"
         )
     }
     #endif

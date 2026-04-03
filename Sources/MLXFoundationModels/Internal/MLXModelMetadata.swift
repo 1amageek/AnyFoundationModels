@@ -1,5 +1,6 @@
 #if MLX_ENABLED
 import Foundation
+@preconcurrency import MLXLMCommon
 
 enum MLXRuntimeFamily: String, Sendable {
     case llm
@@ -7,7 +8,12 @@ enum MLXRuntimeFamily: String, Sendable {
     case unknown
 }
 
-struct MLXModelMetadata: Sendable {
+enum MLXModality: String, Sendable, Hashable {
+    case text
+    case image
+}
+
+struct MLXModelProfile: Sendable {
     enum ThinkingPreference: Sendable {
         case enabled
         case disabled
@@ -16,33 +22,54 @@ struct MLXModelMetadata: Sendable {
 
     let modelID: String
     let runtimeFamily: MLXRuntimeFamily
+    let modalities: Set<MLXModality>
+    let thinkingPreference: ThinkingPreference
 
-    var thinkingPreference: ThinkingPreference {
+    var supportsImages: Bool {
+        modalities.contains(.image)
+    }
+
+    static func fallback(modelID: String) -> Self {
+        Self(
+            modelID: modelID,
+            runtimeFamily: .unknown,
+            modalities: [.text],
+            thinkingPreference: thinkingPreference(for: modelID)
+        )
+    }
+
+    static func make(
+        modelID: String,
+        runtimeFamily: MLXRuntimeFamily,
+        modalities: Set<MLXModality>
+    ) -> Self {
+        Self(
+            modelID: modelID,
+            runtimeFamily: runtimeFamily,
+            modalities: modalities,
+            thinkingPreference: thinkingPreference(for: modelID)
+        )
+    }
+
+    private static func thinkingPreference(for modelID: String) -> ThinkingPreference {
         if modelID.lowercased().contains("qwen") {
             return .disabled
         }
         return .unspecified
     }
-
-    static func fallback(modelID: String) -> Self {
-        Self(modelID: modelID, runtimeFamily: .unknown)
-    }
 }
 
-actor MLXModelMetadataRegistry {
-    static let shared = MLXModelMetadataRegistry()
+public struct MLXLoadedModel: Sendable {
+    public let container: ModelContainer
 
-    private var metadataByModelID: [String: MLXModelMetadata] = [:]
+    let profile: MLXModelProfile
 
-    func register(_ metadata: MLXModelMetadata, aliases: [String] = []) {
-        metadataByModelID[metadata.modelID] = metadata
-        for alias in aliases where !alias.isEmpty {
-            metadataByModelID[alias] = metadata
-        }
-    }
-
-    func metadata(for modelID: String) -> MLXModelMetadata? {
-        metadataByModelID[modelID]
+    init(
+        container: ModelContainer,
+        profile: MLXModelProfile
+    ) {
+        self.container = container
+        self.profile = profile
     }
 }
 #endif

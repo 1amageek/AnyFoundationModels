@@ -27,9 +27,9 @@ let package = Package(
     ],
     dependencies: [
         // Core API
-        .package(url: "https://github.com/1amageek/OpenFoundationModels.git", from: "1.10.0"),
+        .package(url: "https://github.com/1amageek/OpenFoundationModels.git", exact: "1.14.0"),
         // Claude
-        .package(url: "https://github.com/apple/swift-configuration.git", from: "1.0.0"),
+        .package(url: "https://github.com/apple/swift-configuration.git", from: "1.2.0"),
         // Metal
         .package(url: "https://github.com/1amageek/swift-lm.git", exact: "0.1.0"),
         // MLX
@@ -86,16 +86,22 @@ let package = Package(
             name: "MLXFoundationModels",
             dependencies: [
                 .product(name: "OpenFoundationModels", package: "OpenFoundationModels",
+                         moduleAliases: ["Generation": "FoundationGeneration"],
                          condition: .when(traits: ["MLX"])),
                 .product(name: "OpenFoundationModelsExtra", package: "OpenFoundationModels",
+                         moduleAliases: ["Generation": "FoundationGeneration"],
                          condition: .when(traits: ["MLX"])),
                 .product(name: "MLXLLM", package: "mlx-swift-lm",
+                         moduleAliases: ["Generation": "TransformersGeneration"],
                          condition: .when(traits: ["MLX"])),
                 .product(name: "MLXVLM", package: "mlx-swift-lm",
+                         moduleAliases: ["Generation": "TransformersGeneration"],
                          condition: .when(traits: ["MLX"])),
                 .product(name: "MLXLMCommon", package: "mlx-swift-lm",
+                         moduleAliases: ["Generation": "TransformersGeneration"],
                          condition: .when(traits: ["MLX"])),
                 .product(name: "Hub", package: "swift-transformers",
+                         moduleAliases: ["Generation": "TransformersGeneration"],
                          condition: .when(traits: ["MLX"])),
             ],
             swiftSettings: [
@@ -168,12 +174,13 @@ let package = Package(
             dependencies: [
                 .target(name: "MLXFoundationModels", condition: .when(traits: ["MLX"])),
                 .product(name: "OpenFoundationModels", package: "OpenFoundationModels",
-                         condition: .when(traits: ["MLX"])),
-                .product(name: "OpenFoundationModelsCore", package: "OpenFoundationModels",
+                         moduleAliases: ["Generation": "FoundationGeneration"],
                          condition: .when(traits: ["MLX"])),
                 .product(name: "OpenFoundationModelsExtra", package: "OpenFoundationModels",
+                         moduleAliases: ["Generation": "FoundationGeneration"],
                          condition: .when(traits: ["MLX"])),
                 .product(name: "MLXLMCommon", package: "mlx-swift-lm",
+                         moduleAliases: ["Generation": "TransformersGeneration"],
                          condition: .when(traits: ["MLX"])),
             ],
             swiftSettings: [

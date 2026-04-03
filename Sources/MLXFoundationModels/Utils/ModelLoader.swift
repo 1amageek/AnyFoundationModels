@@ -2,215 +2,462 @@
 import Foundation
 import Hub
 import MLXLMCommon
-import MLXLLM
-import MLXVLM
 
-/// Errors that occur during MLX model loading and validation.
 public enum MLXModelLoadingError: LocalizedError {
-    /// The model could not be loaded.
     case loadFailed(modelID: String, underlyingError: Error)
+    case invalidLocalModelDirectory(path: String)
+    case missingConfig(modelID: String, directory: URL)
+    case invalidConfig(modelID: String, directory: URL, underlyingError: Error)
 
     public var errorDescription: String? {
         switch self {
         case .loadFailed(let modelID, let underlyingError):
             return "Failed to load model '\(modelID)': \(underlyingError.localizedDescription)"
+        case .invalidLocalModelDirectory(let path):
+            return "The local model directory is invalid: \(path)"
+        case .missingConfig(let modelID, let directory):
+            return "Missing config.json for model '\(modelID)' at \(directory.path)."
+        case .invalidConfig(let modelID, let directory, let underlyingError):
+            return "Invalid config.json for model '\(modelID)' at \(directory.path): \(underlyingError.localizedDescription)"
         }
     }
 }
 
-/// Unified model loader for HuggingFace models with progress reporting.
-///
-/// Uses `mlx-swift-lm` to resolve either LLM or VLM models from the Hub
-/// and load them into a `ModelContainer`.
-public final class ModelLoader {
-
+public actor ModelLoader {
     private let hubApi: HubApi
-    private var modelCache: [String: ModelContainer] = [:]
-    private let cacheQueue = DispatchQueue(label: "com.openFoundationModels.modelLoader.cache")
+    private var loadedModels: [String: MLXLoadedModel] = [:]
+    private var resolvedArtifacts: [String: URL] = [:]
+    private var inflightArtifacts: [String: Task<URL, Error>] = [:]
+    private var inflightLoads: [String: Task<MLXLoadedModel, Error>] = [:]
 
     public init(hubApi: HubApi = HubApi()) {
         self.hubApi = hubApi
     }
 
-    /// Load a model with optional progress reporting.
-    ///
-    /// Downloads a model from Hugging Face and loads it.
-    /// The `modelID` should be a HuggingFace repository ID
-    /// (e.g., "mlx-community/Qwen2.5-0.5B-Instruct-4bit").
-    ///
-    /// - Parameters:
-    ///   - modelID: Hugging Face repository ID.
-    ///   - progress: Optional `Progress` for download progress reporting.
-    /// - Returns: A fully initialized `ModelContainer` ready for generation.
     public func loadModel(
         _ modelID: String,
         progress: Progress? = nil
-    ) async throws -> ModelContainer {
+    ) async throws -> MLXLoadedModel {
+        let artifact = try resolveArtifactReference(from: modelID)
+        let cacheKey = artifact.cacheKey
 
-        if let localDir = resolveLocalDirectory(from: modelID) {
-            return try await loadLocalModel(from: localDir, modelID: modelID)
-        }
-
-        if let cached = getCachedModel(modelID) {
+        if let cached = loadedModels[cacheKey] {
             progress?.completedUnitCount = progress?.totalUnitCount ?? 1
             progress?.localizedDescription = NSLocalizedString("Model loaded from cache", comment: "")
             return cached
         }
 
-        let loadingProgress = progress ?? Progress(totalUnitCount: 0)
-        let configuration = ModelConfiguration(id: modelID)
-        let container: ModelContainer
-        do {
-            container = try await loadModelContainer(
-                hub: hubApi,
-                configuration: configuration
-            ) { hubProgress in
-                loadingProgress.totalUnitCount = hubProgress.totalUnitCount
-                loadingProgress.completedUnitCount = hubProgress.completedUnitCount
-                loadingProgress.localizedDescription = hubProgress.localizedDescription
-                loadingProgress.localizedAdditionalDescription = hubProgress.localizedAdditionalDescription
-            }
-        } catch {
-            throw MLXModelLoadingError.loadFailed(modelID: modelID, underlyingError: error)
+        if let inflight = inflightLoads[cacheKey] {
+            return try await inflight.value
         }
 
-        let containerConfiguration = await container.configuration
-        let metadata = inferMetadata(modelID: modelID, modelName: containerConfiguration.name)
-        await MLXModelMetadataRegistry.shared.register(
-            metadata,
-            aliases: [containerConfiguration.name]
-        )
+        let task = Task { [hubApi] () async throws -> MLXLoadedModel in
+            let directory = try await self.artifactDirectory(
+                for: artifact,
+                progress: progress,
+                hubApi: hubApi
+            )
+            let profile = try Self.resolveProfile(
+                for: artifact.modelID,
+                directory: directory
+            )
 
-        setCachedModel(container, for: modelID)
+            let container: ModelContainer
+            do {
+                container = try await loadModelContainer(
+                    hub: hubApi,
+                    directory: directory
+                ) { _ in }
+            } catch {
+                throw MLXModelLoadingError.loadFailed(
+                    modelID: artifact.modelID,
+                    underlyingError: error
+                )
+            }
 
-        loadingProgress.completedUnitCount = loadingProgress.totalUnitCount
-        loadingProgress.localizedDescription = NSLocalizedString("Model ready", comment: "")
+            progress?.completedUnitCount = progress?.totalUnitCount
+                ?? progress?.completedUnitCount
+                ?? 1
+            progress?.localizedDescription = NSLocalizedString("Model ready", comment: "")
 
-        return container
+            return MLXLoadedModel(
+                container: container,
+                profile: profile
+            )
+        }
+
+        inflightLoads[cacheKey] = task
+        defer { inflightLoads[cacheKey] = nil }
+
+        let loadedModel = try await task.value
+        loadedModels[cacheKey] = loadedModel
+        return loadedModel
     }
 
-    /// Download a model without loading it into memory.
+    @discardableResult
     public func downloadModel(
         _ modelID: String,
         progress: Progress? = nil
-    ) async throws {
-        _ = try await loadModel(modelID, progress: progress)
-    }
-
-    /// Load a model from a local HF directory.
-    ///
-    /// The directory must contain config.json, safetensors weight files,
-    /// and tokenizer files.
-    ///
-    /// - Parameters:
-    ///   - directory: URL to the HF model directory.
-    ///   - modelID: Optional model identifier for metadata registration.
-    public func loadLocalModel(from directory: URL, modelID: String? = nil) async throws -> ModelContainer {
-        let resolvedID = modelID ?? directory.lastPathComponent
-        let container: ModelContainer
-        do {
-            container = try await loadModelContainer(
-                hub: hubApi,
-                directory: directory
-            ) { _ in }
-        } catch {
-            throw MLXModelLoadingError.loadFailed(modelID: resolvedID, underlyingError: error)
-        }
-
-        let containerConfiguration = await container.configuration
-        let metadata = inferMetadata(modelID: resolvedID, modelName: containerConfiguration.name)
-        await MLXModelMetadataRegistry.shared.register(
-            metadata,
-            aliases: [containerConfiguration.name]
+    ) async throws -> URL {
+        let artifact = try resolveArtifactReference(from: modelID)
+        return try await artifactDirectory(
+            for: artifact,
+            progress: progress,
+            hubApi: hubApi
         )
-
-        setCachedModel(container, for: resolvedID)
-        return container
     }
 
     public func cachedModels() -> [String] {
-        cacheQueue.sync {
-            Array(modelCache.keys)
-        }
+        Array(loadedModels.keys)
     }
 
     public func clearCache() {
-        cacheQueue.sync {
-            modelCache.removeAll()
+        loadedModels.removeAll()
+        resolvedArtifacts.removeAll()
+    }
+
+    public func clearCache(for modelID: String) throws {
+        let artifact = try resolveArtifactReference(from: modelID)
+        loadedModels.removeValue(forKey: artifact.cacheKey)
+        resolvedArtifacts.removeValue(forKey: artifact.cacheKey)
+    }
+
+    public func isCached(_ modelID: String) throws -> Bool {
+        let artifact = try resolveArtifactReference(from: modelID)
+        if loadedModels[artifact.cacheKey] != nil {
+            return true
+        }
+        if let resolvedArtifact = resolvedArtifacts[artifact.cacheKey] {
+            return Self.isUsableModelDirectory(resolvedArtifact)
+        }
+
+        switch artifact.source {
+        case .local(let directory):
+            return Self.isUsableModelDirectory(directory)
+        case .remote(let configuration):
+            return Self.isUsableModelDirectory(configuration.modelDirectory(hub: hubApi))
         }
     }
 
-    public func clearCache(for modelID: String) {
-        _ = cacheQueue.sync {
-            modelCache.removeValue(forKey: modelID)
+    private func resolveArtifactReference(from modelID: String) throws -> ArtifactReference {
+        let trimmed = modelID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.isEmpty == false else {
+            throw MLXModelLoadingError.invalidLocalModelDirectory(path: modelID)
         }
-    }
 
-    public func isCached(_ modelID: String) -> Bool {
-        cacheQueue.sync {
-            modelCache[modelID] != nil
+        if let localDirectory = resolveLocalDirectory(from: trimmed) {
+            return ArtifactReference(
+                cacheKey: localDirectory.path,
+                modelID: trimmed,
+                source: .local(directory: localDirectory)
+            )
         }
-    }
 
-    // MARK: - Metadata Inference
-
-    /// Infers model metadata from the model ID and name.
-    ///
-    /// Architecture detection happens during loading via config.json.
-    /// Metadata for the planner (runtime family, modality) is inferred
-    /// from naming conventions in the model ID.
-    private func inferMetadata(modelID: String, modelName: String) -> MLXModelMetadata {
-        let lowercased = modelID.lowercased()
-        let nameLowercased = modelName.lowercased()
-        let searchable = lowercased + " " + nameLowercased
-
-        let isVLM = searchable.contains("vl") || searchable.contains("vision")
-        let runtimeFamily: MLXRuntimeFamily = isVLM ? .vlm : .llm
-
-        return MLXModelMetadata(
-            modelID: modelID,
-            runtimeFamily: runtimeFamily
+        return ArtifactReference(
+            cacheKey: trimmed,
+            modelID: trimmed,
+            source: .remote(
+                configuration: ModelConfiguration(id: trimmed)
+            )
         )
     }
 
-    // MARK: - Cache
-
-    private func getCachedModel(_ modelID: String) -> ModelContainer? {
-        cacheQueue.sync {
-            modelCache[modelID]
-        }
-    }
-
-    private func setCachedModel(_ container: ModelContainer, for modelID: String) {
-        cacheQueue.sync {
-            modelCache[modelID] = container
-        }
-    }
-
-    /// Resolve a model ID to a local HF directory if it points to a local path.
     private func resolveLocalDirectory(from modelID: String) -> URL? {
-        let trimmed = modelID.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return nil }
-
-        let url: URL
-        if let parsed = URL(string: trimmed), parsed.isFileURL {
-            url = parsed.standardizedFileURL
+        let parsedURL: URL
+        if let url = URL(string: modelID), url.isFileURL {
+            parsedURL = url.standardizedFileURL
         } else {
-            let localURL = URL(fileURLWithPath: trimmed).standardizedFileURL
-            url = localURL
+            parsedURL = URL(fileURLWithPath: modelID).standardizedFileURL
+        }
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: parsedURL.path, isDirectory: &isDirectory),
+              isDirectory.boolValue else {
+            return nil
+        }
+        return parsedURL
+    }
+
+    private struct ArtifactReference: Sendable {
+        enum Source: Sendable {
+            case local(directory: URL)
+            case remote(configuration: ModelConfiguration)
         }
 
-        // Check if it's a directory containing config.json
-        var isDir: ObjCBool = false
-        guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir),
-              isDir.boolValue else {
-            return nil
+        let cacheKey: String
+        let modelID: String
+        let source: Source
+    }
+
+    private func artifactDirectory(
+        for artifact: ArtifactReference,
+        progress: Progress?,
+        hubApi: HubApi
+    ) async throws -> URL {
+        if let resolved = resolvedArtifacts[artifact.cacheKey],
+           Self.isUsableModelDirectory(resolved) {
+            progress?.completedUnitCount = progress?.totalUnitCount ?? 1
+            progress?.localizedDescription = NSLocalizedString("Using cached model artifact", comment: "")
+            return resolved
         }
-        let configPath = url.appendingPathComponent("config.json").path
-        guard FileManager.default.fileExists(atPath: configPath) else {
-            return nil
+
+        if let inflight = inflightArtifacts[artifact.cacheKey] {
+            return try await inflight.value
         }
-        return url
+
+        let task = Task { () async throws -> URL in
+            try await Self.resolveArtifactDirectory(
+                artifact,
+                hubApi: hubApi,
+                progress: progress
+            )
+        }
+
+        inflightArtifacts[artifact.cacheKey] = task
+        defer { inflightArtifacts[artifact.cacheKey] = nil }
+
+        let resolved = try await task.value
+        resolvedArtifacts[artifact.cacheKey] = resolved
+        return resolved
+    }
+
+    private static func resolveArtifactDirectory(
+        _ artifact: ArtifactReference,
+        hubApi: HubApi,
+        progress: Progress?
+    ) async throws -> URL {
+        switch artifact.source {
+        case .local(let directory):
+            guard isUsableModelDirectory(directory) else {
+                throw MLXModelLoadingError.invalidLocalModelDirectory(path: directory.path)
+            }
+            progress?.completedUnitCount = progress?.totalUnitCount ?? 1
+            progress?.localizedDescription = NSLocalizedString("Using local model directory", comment: "")
+            return directory
+        case .remote(let configuration):
+            let directory = configuration.modelDirectory(hub: hubApi)
+            if isUsableModelDirectory(directory) {
+                progress?.completedUnitCount = progress?.totalUnitCount ?? 1
+                progress?.localizedDescription = NSLocalizedString("Using downloaded model snapshot", comment: "")
+                return directory
+            }
+
+            progress?.localizedDescription = NSLocalizedString("Downloading model", comment: "")
+            do {
+                return try await MLXLMCommon.downloadModel(
+                    hub: hubApi,
+                    configuration: configuration
+                ) { hubProgress in
+                    progress?.totalUnitCount = hubProgress.totalUnitCount
+                    progress?.completedUnitCount = hubProgress.completedUnitCount
+                    progress?.localizedDescription = hubProgress.localizedDescription
+                    progress?.localizedAdditionalDescription = hubProgress.localizedAdditionalDescription
+                }
+            } catch {
+                throw MLXModelLoadingError.loadFailed(
+                    modelID: artifact.modelID,
+                    underlyingError: error
+                )
+            }
+        }
+    }
+
+    private static func resolveProfile(
+        for modelID: String,
+        directory: URL
+    ) throws -> MLXModelProfile {
+        let configURL = directory.appendingPathComponent("config.json")
+        guard FileManager.default.fileExists(atPath: configURL.path) else {
+            throw MLXModelLoadingError.missingConfig(modelID: modelID, directory: directory)
+        }
+
+        let data: Data
+        do {
+            data = try Data(contentsOf: configURL)
+        } catch {
+            throw MLXModelLoadingError.invalidConfig(
+                modelID: modelID,
+                directory: directory,
+                underlyingError: error
+            )
+        }
+
+        let jsonObject: Any
+        do {
+            jsonObject = try JSONSerialization.jsonObject(with: data)
+        } catch {
+            throw MLXModelLoadingError.invalidConfig(
+                modelID: modelID,
+                directory: directory,
+                underlyingError: error
+            )
+        }
+
+        guard let dictionary = jsonObject as? [String: Any] else {
+            throw MLXModelLoadingError.invalidConfig(
+                modelID: modelID,
+                directory: directory,
+                underlyingError: CocoaError(.coderInvalidValue)
+            )
+        }
+
+        if containsVisualConfiguration(in: dictionary) {
+            return MLXModelProfile.make(
+                modelID: modelID,
+                runtimeFamily: .vlm,
+                modalities: [.text, .image]
+            )
+        }
+
+        if containsArchitectureMetadata(in: dictionary) {
+            return MLXModelProfile.make(
+                modelID: modelID,
+                runtimeFamily: .llm,
+                modalities: [.text]
+            )
+        }
+
+        return .fallback(modelID: modelID)
+    }
+
+    private static func containsArchitectureMetadata(in dictionary: [String: Any]) -> Bool {
+        if let architectures = dictionary["architectures"] as? [String], architectures.isEmpty == false {
+            return true
+        }
+        if let modelType = dictionary["model_type"] as? String, modelType.isEmpty == false {
+            return true
+        }
+
+        for value in dictionary.values {
+            if let nestedDictionary = value as? [String: Any],
+               containsArchitectureMetadata(in: nestedDictionary) {
+                return true
+            }
+            if let nestedArray = value as? [Any],
+               containsArchitectureMetadata(in: nestedArray) {
+                return true
+            }
+        }
+
+        return false
+    }
+
+    private static func containsArchitectureMetadata(in array: [Any]) -> Bool {
+        for element in array {
+            if let nestedDictionary = element as? [String: Any],
+               containsArchitectureMetadata(in: nestedDictionary) {
+                return true
+            }
+            if let nestedArray = element as? [Any],
+               containsArchitectureMetadata(in: nestedArray) {
+                return true
+            }
+        }
+
+        return false
+    }
+
+    private static func resolveProfileLegacy(
+        for modelID: String
+    ) -> MLXModelProfile {
+        return MLXModelProfile.make(
+            modelID: modelID,
+            runtimeFamily: .llm,
+            modalities: [.text]
+        )
+    }
+
+    private static func isUsableModelDirectory(_ directory: URL) -> Bool {
+        let fileManager = FileManager.default
+        guard fileManager.fileExists(atPath: directory.appendingPathComponent("config.json").path) else {
+            return false
+        }
+
+        guard directoryContains(directory, extension: "safetensors") else {
+            return false
+        }
+
+        let tokenizerCandidates = [
+            "tokenizer.json",
+            "tokenizer.model",
+            "tokenizer_config.json",
+            "spiece.model",
+        ]
+        return tokenizerCandidates.contains { filename in
+            fileManager.fileExists(atPath: directory.appendingPathComponent(filename).path)
+        }
+    }
+
+    private static func directoryContains(
+        _ directory: URL,
+        extension pathExtension: String
+    ) -> Bool {
+        guard let enumerator = FileManager.default.enumerator(
+            at: directory,
+            includingPropertiesForKeys: nil
+        ) else {
+            return false
+        }
+
+        for case let url as URL in enumerator where url.pathExtension == pathExtension {
+            return true
+        }
+        return false
+    }
+
+    private static func containsVisualConfiguration(in dictionary: [String: Any]) -> Bool {
+        let multimodalKeys: Set<String> = [
+            "vision_config",
+            "vision_tower",
+            "image_token",
+            "image_token_id",
+            "image_token_index",
+            "multi_modal_projector",
+            "mm_projector",
+            "mm_projector_type",
+        ]
+
+        for (key, value) in dictionary {
+            if multimodalKeys.contains(key) {
+                return true
+            }
+
+            if key == "architectures",
+               let architectures = value as? [String],
+               architectures.contains(where: { architecture in
+                   let normalized = architecture.lowercased()
+                   return normalized.contains("vision") || normalized.contains("vl")
+               }) {
+                return true
+            }
+
+            if let nestedDictionary = value as? [String: Any],
+               containsVisualConfiguration(in: nestedDictionary) {
+                return true
+            }
+
+            if let nestedArray = value as? [Any],
+               containsVisualConfiguration(in: nestedArray) {
+                return true
+            }
+        }
+
+        return false
+    }
+
+    private static func containsVisualConfiguration(in array: [Any]) -> Bool {
+        for element in array {
+            if let dictionary = element as? [String: Any],
+               containsVisualConfiguration(in: dictionary) {
+                return true
+            }
+
+            if let nestedArray = element as? [Any],
+               containsVisualConfiguration(in: nestedArray) {
+                return true
+            }
+        }
+
+        return false
     }
 }
 #endif

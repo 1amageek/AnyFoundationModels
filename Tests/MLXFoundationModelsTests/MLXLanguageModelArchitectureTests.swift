@@ -2,7 +2,6 @@
 import Foundation
 import MLXLMCommon
 import OpenFoundationModels
-import OpenFoundationModelsCore
 import Testing
 @testable import MLXFoundationModels
 
@@ -19,7 +18,7 @@ struct MLXRequestConverterTests {
             .prompt(.init(segments: [.text(.init(content: "Hello"))])),
         ])
 
-        let result = try converter.convert(transcript: transcript, metadata: llmMetadata())
+        let result = try converter.convert(transcript: transcript, profile: llmProfile())
 
         #expect(!result.hasTools)
         #expect(!result.hasSchema)
@@ -39,7 +38,7 @@ struct MLXRequestConverterTests {
             .prompt(.init(segments: [.text(.init(content: "Search for TODOs"))])),
         ])
 
-        let result = try converter.convert(transcript: transcript, metadata: llmMetadata())
+        let result = try converter.convert(transcript: transcript, profile: llmProfile())
 
         #expect(result.hasTools)
         #expect(!result.hasSchema)
@@ -60,7 +59,7 @@ struct MLXRequestConverterTests {
             .prompt(.init(segments: [.text(.init(content: "Tell me more"))])),
         ])
 
-        let result = try converter.convert(transcript: transcript, metadata: llmMetadata())
+        let result = try converter.convert(transcript: transcript, profile: llmProfile())
 
         // system, user, assistant (tool call text), tool (output), user
         let chat = extractChat(from: result.input)
@@ -86,7 +85,7 @@ struct MLXRequestConverterTests {
             ),
         ])
 
-        let result = try converter.convert(transcript: transcript, metadata: llmMetadata())
+        let result = try converter.convert(transcript: transcript, profile: llmProfile())
 
         #expect(!result.hasTools)
         #expect(result.hasSchema)
@@ -101,8 +100,12 @@ struct MLXRequestConverterTests {
             .prompt(.init(segments: [.text(.init(content: "Hello"))])),
         ])
 
-        let metadata = MLXModelMetadata(modelID: "mlx-community/Qwen3.5-4B", runtimeFamily: .llm)
-        let result = try converter.convert(transcript: transcript, metadata: metadata)
+        let profile = MLXModelProfile.make(
+            modelID: "mlx-community/Qwen3.5-4B",
+            runtimeFamily: .llm,
+            modalities: [.text]
+        )
+        let result = try converter.convert(transcript: transcript, profile: profile)
 
         #expect(result.input.additionalContext?["enable_thinking"] as? Bool == false)
     }
@@ -113,10 +116,48 @@ struct MLXRequestConverterTests {
             .prompt(.init(segments: [.text(.init(content: "Hello"))])),
         ])
 
-        let metadata = MLXModelMetadata(modelID: "mlx-community/Llama-3B", runtimeFamily: .llm)
-        let result = try converter.convert(transcript: transcript, metadata: metadata)
+        let result = try converter.convert(transcript: transcript, profile: llmProfile())
 
         #expect(result.input.additionalContext?["enable_thinking"] == nil)
+    }
+
+    @Test("Images stay attached to the user turn they were added on")
+    func multimodalTurnsPreserveImageAssociation() throws {
+        let png = samplePNGData()
+        let transcript = Transcript(entries: [
+            .prompt(.init(segments: [
+                .text(.init(content: "Describe image one")),
+                .image(.init(source: .base64(data: png.base64EncodedString(), mediaType: "image/png"))),
+            ])),
+            .response(.init(assetIDs: [], segments: [.text(.init(content: "First response"))])),
+            .prompt(.init(segments: [
+                .text(.init(content: "Describe image two")),
+                .image(.init(source: .base64(data: png.base64EncodedString(), mediaType: "image/png"))),
+            ])),
+        ])
+
+        let result = try converter.convert(transcript: transcript, profile: vlmProfile())
+        let chat = extractChat(from: result.input)
+
+        #expect(chat.count == 3)
+        #expect(chat[0].role == .user)
+        #expect(chat[1].role == .assistant)
+        #expect(chat[2].role == .user)
+    }
+
+    @Test("Image input fails for text-only models")
+    func imageInputFailsForTextOnlyModels() throws {
+        let png = samplePNGData()
+        let transcript = Transcript(entries: [
+            .prompt(.init(segments: [
+                .text(.init(content: "Describe this image")),
+                .image(.init(source: .base64(data: png.base64EncodedString(), mediaType: "image/png"))),
+            ])),
+        ])
+
+        #expect(throws: MLXRequestConverter.ConversionError.self) {
+            _ = try converter.convert(transcript: transcript, profile: llmProfile())
+        }
     }
 }
 
@@ -304,27 +345,22 @@ struct ParameterComputationTests {
     }
 }
 
-@Suite("MLX Metadata Registry Tests")
-struct MLXMetadataRegistryTests {
-
-    @Test("Metadata can be looked up by alias")
-    func metadataAliasLookup() async {
-        let modelID = "file:///tmp/\(UUID().uuidString)"
-        let alias = "mlx-community/\(UUID().uuidString)"
-        let metadata = MLXModelMetadata(modelID: modelID, runtimeFamily: .vlm)
-
-        await MLXModelMetadataRegistry.shared.register(metadata, aliases: [alias])
-
-        let resolved = await MLXModelMetadataRegistry.shared.metadata(for: alias)
-        #expect(resolved?.modelID == modelID)
-        #expect(resolved?.runtimeFamily == .vlm)
-    }
-}
-
 // MARK: - Test Helpers
 
-private func llmMetadata() -> MLXModelMetadata {
-    MLXModelMetadata(modelID: "mlx-community/Llama-3B", runtimeFamily: .llm)
+private func llmProfile() -> MLXModelProfile {
+    MLXModelProfile.make(
+        modelID: "mlx-community/Llama-3B",
+        runtimeFamily: .llm,
+        modalities: [.text]
+    )
+}
+
+private func vlmProfile() -> MLXModelProfile {
+    MLXModelProfile.make(
+        modelID: "mlx-community/Gemma-vision",
+        runtimeFamily: .vlm,
+        modalities: [.text, .image]
+    )
 }
 
 private func searchToolDefinition() -> Transcript.ToolDefinition {
@@ -362,6 +398,15 @@ private func dummyInfo() -> GenerateCompletionInfo {
         generationTime: 0.2,
         stopReason: .stop
     )
+}
+
+private func samplePNGData() -> Data {
+    guard let data = Data(
+        base64Encoded: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+b9FEAAAAASUVORK5CYII="
+    ) else {
+        fatalError("Failed to decode test PNG fixture")
+    }
+    return data
 }
 
 /// Replicates the parameter computation logic from MLXLanguageModelRuntime

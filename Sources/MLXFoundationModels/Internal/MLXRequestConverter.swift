@@ -6,6 +6,16 @@ import OpenFoundationModelsExtra
 
 /// Stateless converter: Transcript → UserInput for MLX on-device inference.
 struct MLXRequestConverter {
+    enum ConversionError: LocalizedError {
+        case unsupportedImageInput(modelID: String)
+
+        var errorDescription: String? {
+            switch self {
+            case .unsupportedImageInput(let modelID):
+                return "Model '\(modelID)' does not support image input."
+            }
+        }
+    }
 
     // MARK: - Conversion Result
 
@@ -19,30 +29,17 @@ struct MLXRequestConverter {
 
     func convert(
         transcript: Transcript,
-        metadata: MLXModelMetadata
+        profile: MLXModelProfile
     ) throws -> ConvertedRequest {
         let resolved = transcript.resolved()
-
-        // Extract images from prompt segments
-        var imageSegments: [Transcript.ImageSegment] = []
-        for entry in resolved {
-            if case .prompt(let prompt) = entry {
-                for segment in prompt.segments {
-                    if case .image(let image) = segment {
-                        imageSegments.append(image)
-                    }
-                }
-            }
-        }
-        let images = try ImageSourceConverter.convert(imageSegments)
 
         // Extract schema JSON from response format
         let schemaJSON: String? = encodeSchema(resolved.latestResponseFormat?._schema)
 
         // Build chat messages
-        let messages = buildMessages(
+        let messages = try buildMessages(
             from: resolved,
-            images: images,
+            profile: profile,
             schemaJSON: schemaJSON
         )
 
@@ -51,7 +48,7 @@ struct MLXRequestConverter {
         let toolSpecs = hasTools ? buildToolSpecs(from: resolved.toolDefinitions) : nil
 
         // Build additional context
-        let additionalContext = buildAdditionalContext(metadata: metadata)
+        let additionalContext = buildAdditionalContext(profile: profile)
 
         let input = UserInput(
             chat: messages,
@@ -70,9 +67,9 @@ struct MLXRequestConverter {
 
     private func buildMessages(
         from resolved: ResolvedTranscript,
-        images: [UserInput.Image],
+        profile: MLXModelProfile,
         schemaJSON: String?
-    ) -> [Chat.Message] {
+    ) throws -> [Chat.Message] {
 
         enum MessageType { case system, user, assistant, tool }
         var rawMessages: [(type: MessageType, content: String)] = []
@@ -118,24 +115,30 @@ struct MLXRequestConverter {
             messages.append(.system(content))
         }
 
-        // Non-system messages: attach images to last user message only
-        let nonSystem = rawMessages.filter { $0.type != .system }
-        let lastUserIndex = nonSystem.lastIndex(where: { $0.type == .user })
-
-        for (index, message) in nonSystem.enumerated() {
-            switch message.type {
-            case .user:
-                if index == lastUserIndex && !images.isEmpty {
-                    messages.append(.user(message.content, images: images))
+        for entry in resolved {
+            switch entry {
+            case .instructions:
+                continue
+            case .prompt(let prompt):
+                let images = try images(from: prompt.segments, profile: profile)
+                let content = segmentsToText(prompt.segments)
+                if images.isEmpty {
+                    messages.append(.user(content))
                 } else {
-                    messages.append(.user(message.content))
+                    messages.append(.user(content, images: images))
                 }
-            case .assistant:
-                messages.append(.assistant(message.content))
-            case .tool:
-                messages.append(.tool(message.content))
-            case .system:
-                break
+            case .response(let response):
+                messages.append(.assistant(segmentsToText(response.segments)))
+            case .tool(let interaction):
+                let callText = interaction.calls
+                    .map { "\($0.toolName)(\($0.arguments.jsonString))" }
+                    .joined(separator: "\n")
+                if callText.isEmpty == false {
+                    messages.append(.assistant(callText))
+                }
+                for output in interaction.outputs {
+                    messages.append(.tool(segmentsToText(output.segments)))
+                }
             }
         }
 
@@ -215,10 +218,10 @@ struct MLXRequestConverter {
     // MARK: - Additional Context
 
     private func buildAdditionalContext(
-        metadata: MLXModelMetadata
+        profile: MLXModelProfile
     ) -> [String: any Sendable] {
         var context: [String: any Sendable] = [:]
-        switch metadata.thinkingPreference {
+        switch profile.thinkingPreference {
         case .enabled:
             context["enable_thinking"] = true
         case .disabled:
@@ -246,6 +249,28 @@ struct MLXRequestConverter {
             }
         }
         return texts.joined(separator: " ")
+    }
+
+    private func images(
+        from segments: [Transcript.Segment],
+        profile: MLXModelProfile
+    ) throws -> [UserInput.Image] {
+        let imageSegments = segments.compactMap { segment -> Transcript.ImageSegment? in
+            if case .image(let image) = segment {
+                return image
+            }
+            return nil
+        }
+
+        guard imageSegments.isEmpty == false else {
+            return []
+        }
+
+        guard profile.supportsImages else {
+            throw ConversionError.unsupportedImageInput(modelID: profile.modelID)
+        }
+
+        return try ImageSourceConverter.convert(imageSegments)
     }
 }
 #endif

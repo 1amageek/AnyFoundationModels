@@ -7,8 +7,8 @@ public struct MLXLanguageModel: OpenFoundationModels.LanguageModel, Sendable {
 
     private let runtime: MLXLanguageModelRuntime
 
-    public init(modelContainer: ModelContainer) {
-        self.runtime = MLXLanguageModelRuntime(modelContainer: modelContainer)
+    public init(loadedModel: MLXLoadedModel) {
+        self.runtime = MLXLanguageModelRuntime(loadedModel: loadedModel)
     }
 
     public var isAvailable: Bool { true }
