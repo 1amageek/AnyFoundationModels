@@ -31,16 +31,6 @@ actor MLXLanguageModelRuntime {
             profile: profile
         )
 
-        #if DEBUG
-        logRequest(
-            profile: profile,
-            hasTools: hasTools,
-            hasSchema: hasSchema,
-            promptTokenCount: promptTokenCount,
-            parameters: parameters
-        )
-        #endif
-
         let stream = try await modelContainer.generate(
             input: lmInput,
             parameters: parameters
@@ -81,77 +71,45 @@ actor MLXLanguageModelRuntime {
                         profile: self.profile
                     )
 
-                    #if DEBUG
-                    self.logRequest(
-                        profile: self.profile,
-                        hasTools: hasTools,
-                        hasSchema: hasSchema,
-                        promptTokenCount: promptTokenCount,
-                        parameters: parameters
-                    )
-                    #endif
-
                     let stream = try await self.modelContainer.generate(
                         input: lmInput,
                         parameters: parameters
                     )
 
-                    if !hasTools {
-                        // Text mode: stream deltas incrementally
-                        var streamingState = MLXResponseConverter.StreamingState()
-                        var allGenerations: [Generation] = []
-
-                        for await generation in stream {
-                            try Task.checkCancellation()
-                            allGenerations.append(generation)
-
-                            if case .chunk(let text) = generation {
-                                let delta = self.responseConverter.streamDelta(
-                                    state: &streamingState,
-                                    chunk: text
-                                )
-                                if !delta.isEmpty {
-                                    continuation.yield(
-                                        self.responseConverter.streamEntry(for: delta)
-                                    )
-                                }
-                            }
-                        }
-
-                        // Flush trailing text after final sanitization
-                        let sanitized = self.responseConverter.sanitizeAssistantResponse(
-                            streamingState.rawText
-                        )
-                        if !sanitized.isEmpty,
-                           sanitized != streamingState.emittedVisibleText
-                        {
-                            let startIndex = sanitized.index(
-                                sanitized.startIndex,
-                                offsetBy: streamingState.emittedVisibleText.count
+                    var generations: [Generation] = []
+                    var streamingState = MLXResponseConverter.StreamingState()
+                    var hasYieldedResponseEntry = false
+                    for await generation in stream {
+                        try Task.checkCancellation()
+                        generations.append(generation)
+                        if case .chunk(let text) = generation {
+                            let deltas = self.responseConverter.streamDelta(
+                                state: &streamingState,
+                                chunk: text
                             )
-                            let trailing = String(sanitized[startIndex...])
-                            if !trailing.isEmpty {
-                                continuation.yield(
-                                    self.responseConverter.streamEntry(for: trailing)
-                                )
+                            if let entry = self.responseConverter.streamEntry(
+                                answer: deltas.answer,
+                                reasoning: deltas.reasoning
+                            ) {
+                                continuation.yield(entry)
+                                hasYieldedResponseEntry = true
                             }
                         }
-                    } else {
-                        // Tool mode: buffer everything, yield final entry at end
-                        var allGenerations: [Generation] = []
-                        for await generation in stream {
-                            try Task.checkCancellation()
-                            allGenerations.append(generation)
-                        }
-
-                        let entry = try self.responseConverter.finalEntry(
-                            from: allGenerations,
-                            hasTools: hasTools,
-                            hasSchema: hasSchema
-                        )
-                        continuation.yield(entry)
                     }
 
+                    let final = try self.responseConverter.finalEntry(
+                        from: generations,
+                        hasTools: hasTools,
+                        hasSchema: hasSchema
+                    )
+                    switch final {
+                    case .toolCalls:
+                        continuation.yield(final)
+                    case .response where !hasYieldedResponseEntry:
+                        continuation.yield(final)
+                    default:
+                        break
+                    }
                     continuation.finish()
                 } catch is CancellationError {
                     continuation.finish()
@@ -173,19 +131,16 @@ actor MLXLanguageModelRuntime {
         promptTokenCount: Int,
         profile: MLXModelProfile
     ) -> GenerateParameters {
-        // Prefill step size scales with prompt length
         var prefillStepSize = 512
         if promptTokenCount > 8192 {
             prefillStepSize = 1536
         } else if promptTokenCount > 2048 {
             prefillStepSize = 1024
         }
-        // VLM cap
         if profile.runtimeFamily == .vlm {
             prefillStepSize = min(prefillStepSize, 1024)
         }
 
-        // KV quantization for long prompts
         let kvBits: Int? = promptTokenCount > 8192 ? 4 : nil
         let quantizedKVStart = kvBits == nil ? 0 : 4096
 
@@ -202,21 +157,5 @@ actor MLXLanguageModelRuntime {
             prefillStepSize: prefillStepSize
         )
     }
-
-    // MARK: - Debug Logging
-
-    #if DEBUG
-    private func logRequest(
-        profile: MLXModelProfile,
-        hasTools: Bool,
-        hasSchema: Bool,
-        promptTokenCount: Int,
-        parameters: GenerateParameters
-    ) {
-        print(
-            "[MLXLanguageModel] generate modelID=\(profile.modelID) runtime=\(profile.runtimeFamily.rawValue) hasTools=\(hasTools) hasSchema=\(hasSchema) promptTokens=\(promptTokenCount) prefillStep=\(parameters.prefillStepSize) kvBits=\(String(describing: parameters.kvBits))"
-        )
-    }
-    #endif
 }
 #endif

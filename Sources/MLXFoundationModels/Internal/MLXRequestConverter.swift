@@ -32,34 +32,25 @@ struct MLXRequestConverter {
         profile: MLXModelProfile
     ) throws -> ConvertedRequest {
         let resolved = transcript.resolved()
+        let responseSchema = resolved.latestResponseFormat?._schema
 
-        // Extract schema JSON from response format
-        let schemaJSON: String? = encodeSchema(resolved.latestResponseFormat?._schema)
-
-        // Build chat messages
-        let messages = try buildMessages(
-            from: resolved,
+        let messages = try buildMessages(from: resolved, profile: profile)
+        let toolSpecs = buildToolSpecs(from: resolved.toolDefinitions)
+        let additionalContext = buildAdditionalContext(
             profile: profile,
-            schemaJSON: schemaJSON
+            responseSchema: responseSchema
         )
-
-        // Build tool specs
-        let hasTools = !resolved.toolDefinitions.isEmpty
-        let toolSpecs = hasTools ? buildToolSpecs(from: resolved.toolDefinitions) : nil
-
-        // Build additional context
-        let additionalContext = buildAdditionalContext(profile: profile)
 
         let input = UserInput(
             chat: messages,
             tools: toolSpecs,
-            additionalContext: additionalContext
+            additionalContext: additionalContext.isEmpty ? nil : additionalContext
         )
 
         return ConvertedRequest(
             input: input,
-            hasTools: hasTools,
-            hasSchema: schemaJSON != nil
+            hasTools: !resolved.toolDefinitions.isEmpty,
+            hasSchema: responseSchema != nil
         )
     }
 
@@ -67,65 +58,24 @@ struct MLXRequestConverter {
 
     private func buildMessages(
         from resolved: ResolvedTranscript,
-        profile: MLXModelProfile,
-        schemaJSON: String?
+        profile: MLXModelProfile
     ) throws -> [Chat.Message] {
-
-        enum MessageType { case system, user, assistant, tool }
-        var rawMessages: [(type: MessageType, content: String)] = []
+        var messages: [Chat.Message] = []
 
         for entry in resolved {
             switch entry {
             case .instructions(let instructions):
                 let text = segmentsToText(instructions.segments)
                 if !text.isEmpty {
-                    rawMessages.append((.system, text))
+                    messages.append(.system(text))
                 }
             case .prompt(let prompt):
-                rawMessages.append((.user, segmentsToText(prompt.segments)))
-            case .response(let response):
-                rawMessages.append((.assistant, segmentsToText(response.segments)))
-            case .tool(let interaction):
-                let callText = interaction.calls
-                    .map { "\($0.toolName)(\($0.arguments.jsonString))" }
-                    .joined(separator: "\n")
-                if !callText.isEmpty {
-                    rawMessages.append((.assistant, callText))
-                }
-                for output in interaction.outputs {
-                    rawMessages.append((.tool, segmentsToText(output.segments)))
-                }
-            }
-        }
-
-        var messages: [Chat.Message] = []
-
-        // System message: join all instructions, append schema if present
-        let systemTexts = rawMessages
-            .filter { $0.type == .system }
-            .map(\.content)
-            .filter { !$0.isEmpty }
-
-        if !systemTexts.isEmpty || schemaJSON != nil {
-            var content = systemTexts.joined(separator: "\n\n")
-            if let schemaJSON {
-                if !content.isEmpty { content += "\n\n" }
-                content += "Respond with JSON matching this schema:\n\(schemaJSON)"
-            }
-            messages.append(.system(content))
-        }
-
-        for entry in resolved {
-            switch entry {
-            case .instructions:
-                continue
-            case .prompt(let prompt):
-                let images = try images(from: prompt.segments, profile: profile)
                 let content = segmentsToText(prompt.segments)
-                if images.isEmpty {
+                let imgs = try images(from: prompt.segments, profile: profile)
+                if imgs.isEmpty {
                     messages.append(.user(content))
                 } else {
-                    messages.append(.user(content, images: images))
+                    messages.append(.user(content, images: imgs))
                 }
             case .response(let response):
                 messages.append(.assistant(segmentsToText(response.segments)))
@@ -133,7 +83,7 @@ struct MLXRequestConverter {
                 let callText = interaction.calls
                     .map { "\($0.toolName)(\($0.arguments.jsonString))" }
                     .joined(separator: "\n")
-                if callText.isEmpty == false {
+                if !callText.isEmpty {
                     messages.append(.assistant(callText))
                 }
                 for output in interaction.outputs {
@@ -143,6 +93,30 @@ struct MLXRequestConverter {
         }
 
         return messages
+    }
+
+    // MARK: - Additional Context
+
+    private func buildAdditionalContext(
+        profile: MLXModelProfile,
+        responseSchema: GenerationSchema?
+    ) -> [String: any Sendable] {
+        var context: [String: any Sendable] = [:]
+
+        switch profile.thinkingPreference {
+        case .enabled:
+            context["enable_thinking"] = true
+        case .disabled:
+            context["enable_thinking"] = false
+        case .unspecified:
+            break
+        }
+
+        if let schema = responseSchema, let schemaJSON = encodeSchemaString(schema) {
+            context["response_schema"] = schemaJSON
+        }
+
+        return context
     }
 
     // MARK: - Tool Specs
@@ -183,6 +157,18 @@ struct MLXRequestConverter {
         return sendableValue(for: jsonValue)
     }
 
+    private func encodeSchemaString(_ schema: GenerationSchema) -> String? {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        do {
+            let data = try encoder.encode(schema)
+            return String(decoding: data, as: UTF8.self)
+        } catch {
+            Logger.warning("[MLXRequestConverter] Failed to encode response schema: \(error)")
+            return nil
+        }
+    }
+
     private func sendableValue(for jsonValue: MLXLMCommon.JSONValue) -> any Sendable {
         switch jsonValue {
         case .null:
@@ -202,36 +188,6 @@ struct MLXRequestConverter {
         }
     }
 
-    private func encodeSchema(_ schema: GenerationSchema?) -> String? {
-        guard let schema else { return nil }
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.sortedKeys]
-        do {
-            let data = try encoder.encode(schema)
-            return String(decoding: data, as: UTF8.self)
-        } catch {
-            Logger.warning("[MLXRequestConverter] Failed to encode schema: \(error)")
-            return nil
-        }
-    }
-
-    // MARK: - Additional Context
-
-    private func buildAdditionalContext(
-        profile: MLXModelProfile
-    ) -> [String: any Sendable] {
-        var context: [String: any Sendable] = [:]
-        switch profile.thinkingPreference {
-        case .enabled:
-            context["enable_thinking"] = true
-        case .disabled:
-            context["enable_thinking"] = false
-        case .unspecified:
-            break
-        }
-        return context
-    }
-
     // MARK: - Segment → Text
 
     private func segmentsToText(_ segments: [Transcript.Segment]) -> String {
@@ -241,6 +197,8 @@ struct MLXRequestConverter {
             switch segment {
             case .text(let text):
                 texts.append(text.content)
+            case .reasoning:
+                continue
             case .structure(let structure):
                 texts.append(structure.content.jsonString)
             case .image:
@@ -262,7 +220,7 @@ struct MLXRequestConverter {
             return nil
         }
 
-        guard imageSegments.isEmpty == false else {
+        guard !imageSegments.isEmpty else {
             return []
         }
 

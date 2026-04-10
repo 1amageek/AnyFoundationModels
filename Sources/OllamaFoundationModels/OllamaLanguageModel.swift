@@ -84,7 +84,7 @@ public final class OllamaLanguageModel: LanguageModel, Sendable {
         let response: ChatResponse = try await httpClient.send(buildResult.request, to: "/api/chat")
 
         guard let message = response.message else {
-            return createResponseEntry(content: "")
+            return createResponseEntry(content: "", reasoning: "")
         }
 
         #if DEBUG
@@ -105,16 +105,16 @@ public final class OllamaLanguageModel: LanguageModel, Sendable {
             print("[Ollama] Processed as: toolCalls (\(toolCalls.count))")
             #endif
             return createToolCallsEntry(from: toolCalls)
-        case .content(let content):
+        case .response(let response):
             #if DEBUG
-            print("[Ollama] Processed as: content")
+            print("[Ollama] Processed as: response")
             #endif
-            return createResponseEntry(content: content)
+            return createResponseEntry(content: response.content, reasoning: response.reasoning)
         case .empty:
             #if DEBUG
             print("[Ollama] Processed as: empty")
             #endif
-            return createResponseEntry(content: "")
+            return createResponseEntry(content: "", reasoning: "")
         }
     }
 
@@ -135,22 +135,17 @@ public final class OllamaLanguageModel: LanguageModel, Sendable {
                         to: "/api/chat"
                     )
 
-                    var hasYieldedContent = false
                     var accumulatedContent = ""
                     var accumulatedThinking = ""
+                    var emittedContent = ""
+                    var emittedReasoning = ""
                     var nativeToolCalls: [ToolCall] = []
+                    var hasYieldedResponseEntry = false
 
                     for try await chunk in rawStream {
                         // Accumulate content
                         if let content = chunk.message?.content, !content.isEmpty {
                             accumulatedContent += content
-
-                            // Yield content incrementally (only if no tool call patterns detected yet)
-                            if !chunk.done && !TextToolCallParser.containsToolCallPatterns(accumulatedContent) {
-                                let entry = self.createResponseEntry(content: content)
-                                continuation.yield(entry)
-                                hasYieldedContent = true
-                            }
                         }
 
                         // Accumulate thinking content
@@ -161,6 +156,25 @@ public final class OllamaLanguageModel: LanguageModel, Sendable {
                         // Accumulate native tool calls
                         if let toolCalls = chunk.message?.toolCalls {
                             nativeToolCalls.append(contentsOf: toolCalls)
+                        }
+
+                        let containsTextualToolCalls =
+                            TextToolCallParser.containsToolCallPatterns(accumulatedContent) ||
+                            TextToolCallParser.containsToolCallPatterns(accumulatedThinking)
+
+                        if !chunk.done && nativeToolCalls.isEmpty && !containsTextualToolCalls {
+                            let normalized = self.responseProcessor.normalize(
+                                content: accumulatedContent,
+                                thinking: accumulatedThinking.isEmpty ? nil : accumulatedThinking
+                            )
+                            if let entry = self.makeDeltaResponseEntry(
+                                normalized: normalized,
+                                emittedContent: &emittedContent,
+                                emittedReasoning: &emittedReasoning
+                            ) {
+                                continuation.yield(entry)
+                                hasYieldedResponseEntry = true
+                            }
                         }
 
                         // On stream completion
@@ -178,14 +192,25 @@ public final class OllamaLanguageModel: LanguageModel, Sendable {
                             case .toolCalls(let toolCalls):
                                 continuation.yield(self.createToolCallsEntry(from: toolCalls))
 
-                            case .content(let content):
-                                if !hasYieldedContent {
-                                    continuation.yield(self.createResponseEntry(content: content))
+                            case .response(let response):
+                                if let entry = self.makeDeltaResponseEntry(
+                                    normalized: response,
+                                    emittedContent: &emittedContent,
+                                    emittedReasoning: &emittedReasoning
+                                ) {
+                                    continuation.yield(entry)
+                                } else if !hasYieldedResponseEntry {
+                                    continuation.yield(
+                                        self.createResponseEntry(
+                                            content: response.content,
+                                            reasoning: response.reasoning
+                                        )
+                                    )
                                 }
 
                             case .empty:
-                                if !hasYieldedContent {
-                                    continuation.yield(self.createResponseEntry(content: ""))
+                                if !hasYieldedResponseEntry {
+                                    continuation.yield(self.createResponseEntry(content: "", reasoning: ""))
                                 }
                             }
                         }
@@ -248,18 +273,52 @@ public final class OllamaLanguageModel: LanguageModel, Sendable {
         )
     }
 
-    /// Create response entry from content string
-    private func createResponseEntry(content: String) -> Transcript.Entry {
+    /// Create response entry from normalized content and reasoning strings.
+    private func createResponseEntry(content: String, reasoning: String) -> Transcript.Entry {
+        let segments = makeResponseSegments(content: content, reasoning: reasoning)
         return .response(
             Transcript.Response(
                 id: UUID().uuidString,
                 assetIDs: [],
-                segments: [.text(Transcript.TextSegment(
-                    id: UUID().uuidString,
-                    content: content
-                ))]
+                segments: segments
             )
         )
+    }
+
+    private func makeDeltaResponseEntry(
+        normalized: ResponseProcessor.ResponseChannels,
+        emittedContent: inout String,
+        emittedReasoning: inout String
+    ) -> Transcript.Entry? {
+        let contentDelta = delta(current: normalized.content, emitted: &emittedContent)
+        let reasoningDelta = delta(current: normalized.reasoning, emitted: &emittedReasoning)
+        guard !contentDelta.isEmpty || !reasoningDelta.isEmpty else {
+            return nil
+        }
+        return createResponseEntry(content: contentDelta, reasoning: reasoningDelta)
+    }
+
+    private func delta(current: String, emitted: inout String) -> String {
+        let delta: String
+        if current.hasPrefix(emitted) {
+            let startIndex = current.index(current.startIndex, offsetBy: emitted.count)
+            delta = String(current[startIndex...])
+        } else {
+            delta = current
+        }
+        emitted = current
+        return delta
+    }
+
+    private func makeResponseSegments(content: String, reasoning: String) -> [Transcript.Segment] {
+        var segments: [Transcript.Segment] = []
+        if !reasoning.isEmpty {
+            segments.append(.reasoning(.init(id: UUID().uuidString, content: reasoning)))
+        }
+        if !content.isEmpty || segments.isEmpty {
+            segments.append(.text(.init(id: UUID().uuidString, content: content)))
+        }
+        return segments
     }
 
 }

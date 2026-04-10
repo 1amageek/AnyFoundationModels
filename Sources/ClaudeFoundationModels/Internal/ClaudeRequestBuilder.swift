@@ -125,6 +125,7 @@ internal struct ClaudeRequestBuilder: OpenFoundationModelsExtra.RequestBuilder {
         segments.compactMap { segment in
             switch segment {
             case .text(let t): return .text(TextBlock(text: t.content))
+            case .reasoning: return nil
             case .structure(let s): return .text(TextBlock(text: s.content.jsonString))
             case .image(let img):
                 switch img.source {

@@ -4,7 +4,7 @@ import Foundation
 /// Result of processing a Message
 enum ProcessedResponse: Sendable {
     case toolCalls([ToolCall])
-    case content(String)
+    case response(ResponseProcessor.ResponseChannels)
     case empty
 }
 
@@ -18,6 +18,11 @@ enum ProcessedResponse: Sendable {
 /// - JSON extraction from mixed content
 /// - Content/thinking fallback handling
 struct ResponseProcessor: Sendable {
+
+    struct ResponseChannels: Sendable, Equatable {
+        let content: String
+        let reasoning: String
+    }
 
     // MARK: - Patterns
 
@@ -35,9 +40,9 @@ struct ResponseProcessor: Sendable {
         options: [.caseInsensitive]
     )
 
-    /// Pattern to match <content>...</content> tags
+    /// Pattern to match content wrapper tags
     private static let contentTagPattern = try! NSRegularExpression(
-        pattern: #"<content>[\s\S]*?</content>"#,
+        pattern: #"</?content>"#,
         options: [.caseInsensitive]
     )
 
@@ -70,12 +75,6 @@ struct ResponseProcessor: Sendable {
             if !result.toolCalls.isEmpty {
                 return .toolCalls(result.toolCalls)
             }
-            // Even when no tool call is parsed, parser may normalize malformed wrappers.
-            // Prefer the normalized remainder over raw content to avoid leaking `<tool_call...`.
-            let normalized = processContent(result.remainingContent)
-            if !normalized.isEmpty {
-                return .content(normalized)
-            }
         }
 
         // 3. Text-based tool calls in thinking field
@@ -85,36 +84,38 @@ struct ResponseProcessor: Sendable {
             if !result.toolCalls.isEmpty {
                 return .toolCalls(result.toolCalls)
             }
-            let normalized = processContent(result.remainingContent)
-            if !normalized.isEmpty {
-                return .content(normalized)
-            }
         }
 
-        // 4. Process content - strip <think> tags and extract clean content
-        let processedContent = processContent(message.content)
-        if !processedContent.isEmpty {
-            return .content(processedContent)
-        }
-
-        // 5. Thinking (fallback for thinking models like lfm2.5-thinking)
-        if let thinking = message.thinking, !thinking.isEmpty {
-            // Also process thinking field to strip any <think> tags
-            let processedThinking = processContent(thinking)
-            if !processedThinking.isEmpty {
-                return .content(processedThinking)
-            }
-            // If processing strips everything, use original
-            return .content(thinking)
+        // 4. Normalize content and reasoning into separate channels
+        let normalized = normalize(content: message.content, thinking: message.thinking)
+        if !normalized.content.isEmpty || !normalized.reasoning.isEmpty {
+            return .response(normalized)
         }
 
         return .empty
     }
 
+    func normalize(content: String, thinking: String?) -> ResponseChannels {
+        let inlineChannels = splitInlineThinking(from: content)
+        let normalizedContent = processContent(inlineChannels.content)
+
+        let normalizedReasoning: String
+        if let thinking, !thinking.isEmpty {
+            normalizedReasoning = processReasoning(thinking)
+        } else {
+            normalizedReasoning = processReasoning(inlineChannels.reasoning)
+        }
+
+        return ResponseChannels(
+            content: normalizedContent,
+            reasoning: normalizedReasoning
+        )
+    }
+
     // MARK: - Private Helpers
 
     /// Process content to extract clean response
-    /// Step 1: Strip think tags to get actual content
+    /// Step 1: Strip content wrapper tags
     /// Step 2: Extract JSON from the content
     private func processContent(_ content: String) -> String {
         guard !content.isEmpty else { return "" }
@@ -124,8 +125,8 @@ struct ResponseProcessor: Sendable {
         print("[ResponseProcessor] Input preview: \(String(content.prefix(300)))")
         #endif
 
-        // Step 1: Strip think-related tags
-        let strippedContent = stripThinkTags(from: content)
+        // Step 1: Strip non-semantic wrapper tags
+        let strippedContent = stripContentTags(from: content)
 
         #if DEBUG
         print("[ResponseProcessor] After stripThinkTags length: \(strippedContent.count)")
@@ -155,16 +156,17 @@ struct ResponseProcessor: Sendable {
         return strippedContent.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    // MARK: - Think Tag Stripping
+    private func processReasoning(_ reasoning: String) -> String {
+        guard !reasoning.isEmpty else { return "" }
+        return stripContentTags(from: stripThinkTags(from: reasoning))
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    // MARK: - Tag Stripping
 
     /// Strip all think-related tags from content
     private func stripThinkTags(from content: String) -> String {
         var processed = content
-
-        // Strip <content>...</content> tags
-        if processed.contains("<content>") {
-            processed = stripPattern(Self.contentTagPattern, from: processed)
-        }
 
         // Strip orphaned </think> and everything before it
         if processed.contains("</think>") && !processed.contains("<think") {
@@ -179,10 +181,57 @@ struct ResponseProcessor: Sendable {
         return processed
     }
 
+    private func stripContentTags(from content: String) -> String {
+        guard content.localizedCaseInsensitiveContains("<content") else {
+            return content
+        }
+        return stripPattern(Self.contentTagPattern, from: content)
+    }
+
     /// Strip pattern from content
     private func stripPattern(_ pattern: NSRegularExpression, from content: String) -> String {
         let range = NSRange(content.startIndex..<content.endIndex, in: content)
         return pattern.stringByReplacingMatches(in: content, options: [], range: range, withTemplate: "")
+    }
+
+    private func splitInlineThinking(from content: String) -> ResponseChannels {
+        let openTag = "<think>"
+        let closeTag = "</think>"
+
+        if !content.localizedCaseInsensitiveContains(openTag),
+           let closeRange = content.range(of: closeTag, options: [.caseInsensitive]) {
+            let reasoning = String(content[..<closeRange.lowerBound])
+            let visible = String(content[closeRange.upperBound...])
+            return ResponseChannels(content: visible, reasoning: reasoning)
+        }
+
+        var visible = ""
+        var reasoning = ""
+        var index = content.startIndex
+        var insideThink = false
+
+        while index < content.endIndex {
+            if content[index...].hasPrefix(openTag) {
+                insideThink = true
+                index = content.index(index, offsetBy: openTag.count)
+                continue
+            }
+
+            if content[index...].hasPrefix(closeTag) {
+                insideThink = false
+                index = content.index(index, offsetBy: closeTag.count)
+                continue
+            }
+
+            if insideThink {
+                reasoning.append(content[index])
+            } else {
+                visible.append(content[index])
+            }
+            index = content.index(after: index)
+        }
+
+        return ResponseChannels(content: visible, reasoning: reasoning)
     }
 
     // MARK: - JSON Extraction

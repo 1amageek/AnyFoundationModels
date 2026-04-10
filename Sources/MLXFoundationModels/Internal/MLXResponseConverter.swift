@@ -7,11 +7,17 @@ import OpenFoundationModelsExtra
 /// Stateless converter: Generation events → Transcript.Entry.
 struct MLXResponseConverter {
 
+    struct ResponseChannels: Sendable {
+        let answer: String
+        let reasoning: String
+    }
+
     // MARK: - Streaming State
 
     struct StreamingState: Sendable {
         var rawText: String = ""
         var emittedVisibleText: String = ""
+        var emittedReasoningText: String = ""
     }
 
     // MARK: - Final Entry Assembly
@@ -45,22 +51,31 @@ struct MLXResponseConverter {
             return try nativeToolCallEntry(from: nativeToolCalls)
         }
 
-        let sanitized = sanitizeAssistantResponse(text)
+        let channels = splitResponseChannels(
+            from: text,
+            allowIncompleteTrailingTag: false,
+            trimWhitespace: false
+        )
+        let sanitizedAnswer = sanitizeAnswer(channels.answer)
+        let sanitizedReasoning = sanitizeReasoning(channels.reasoning)
 
         // Priority 2: Textual tool call detection
-        if hasTools, let toolEntry = ToolCallDetector.entryIfPresent(sanitized) {
+        if hasTools, let toolEntry = ToolCallDetector.entryIfPresent(sanitizedAnswer) {
             return toolEntry
         }
 
         // Priority 3: Structured response
         if hasSchema {
-            let content = sanitized.isEmpty ? "" : sanitized
+            let content = sanitizedAnswer.isEmpty ? "" : sanitizedAnswer
             do {
                 let generatedContent = try GeneratedContent(json: content)
                 return .response(
                     .init(
                         assetIDs: [],
-                        segments: [.structure(.init(source: "mlx", content: generatedContent))]
+                        segments: makeResponseSegments(
+                            answer: [.structure(.init(source: "mlx", content: generatedContent))],
+                            reasoning: sanitizedReasoning
+                        )
                     )
                 )
             } catch {
@@ -69,67 +84,106 @@ struct MLXResponseConverter {
         }
 
         // Priority 4: Plain text response
-        let content = sanitized.isEmpty ? text : sanitized
-        return .response(.init(assetIDs: [], segments: [.text(.init(content: content))]))
+        return .response(
+            .init(
+                assetIDs: [],
+                segments: makeResponseSegments(
+                    answer: sanitizedAnswer.isEmpty ? [] : [.text(.init(content: sanitizedAnswer))],
+                    reasoning: sanitizedReasoning
+                )
+            )
+        )
     }
 
     // MARK: - Streaming
 
     /// Processes a text chunk incrementally, stripping think blocks.
     /// Returns the visible text delta to emit.
-    func streamDelta(state: inout StreamingState, chunk: String) -> String {
+    func streamDelta(state: inout StreamingState, chunk: String) -> ResponseChannels {
         state.rawText += chunk
 
-        let visible = visibleAssistantText(
+        let channels = splitResponseChannels(
             from: state.rawText,
             allowIncompleteTrailingTag: true,
             trimWhitespace: false
         )
 
-        let delta: String
-        if visible.hasPrefix(state.emittedVisibleText) {
-            let startIndex = visible.index(
-                visible.startIndex,
-                offsetBy: state.emittedVisibleText.count
-            )
-            delta = String(visible[startIndex...])
-        } else {
-            delta = visible
-        }
+        let answerDelta = computeDelta(
+            current: channels.answer,
+            emitted: &state.emittedVisibleText
+        )
+        let reasoningDelta = computeDelta(
+            current: channels.reasoning,
+            emitted: &state.emittedReasoningText
+        )
 
-        state.emittedVisibleText = visible
-        return delta
+        return ResponseChannels(answer: answerDelta, reasoning: reasoningDelta)
     }
 
-    /// Wraps a text chunk in a Transcript.Entry for streaming.
-    func streamEntry(for text: String) -> Transcript.Entry {
-        .response(.init(assetIDs: [], segments: [.text(.init(content: text))]))
+    /// Wraps text and reasoning deltas in a Transcript.Entry for streaming.
+    func streamEntry(answer: String, reasoning: String) -> Transcript.Entry? {
+        guard !answer.isEmpty || !reasoning.isEmpty else {
+            return nil
+        }
+        let segments = makeResponseSegments(
+            answer: answer.isEmpty ? [] : [.text(.init(content: answer))],
+            reasoning: reasoning
+        )
+        return .response(.init(assetIDs: [], segments: segments))
     }
 
     // MARK: - Sanitization
 
     /// Strips think blocks, code fences, and trims whitespace from model output.
     func sanitizeAssistantResponse(_ text: String) -> String {
-        var result = visibleAssistantText(
+        let channels = splitResponseChannels(
             from: text,
             allowIncompleteTrailingTag: false,
             trimWhitespace: false
         )
-        result = stripCodeFenceIfJSON(result)
-        return result.trimmingCharacters(in: .whitespacesAndNewlines)
+        return sanitizeAnswer(channels.answer)
     }
 
-    // MARK: - Private: Think Block Stripping
+    // MARK: - Private: Response Channel Parsing
 
-    private func visibleAssistantText(
+    private func computeDelta(
+        current: String,
+        emitted: inout String
+    ) -> String {
+        let delta: String
+        if current.hasPrefix(emitted) {
+            let startIndex = current.index(
+                current.startIndex,
+                offsetBy: emitted.count
+            )
+            delta = String(current[startIndex...])
+        } else {
+            delta = current
+        }
+        emitted = current
+        return delta
+    }
+
+    private func splitResponseChannels(
         from text: String,
         allowIncompleteTrailingTag: Bool,
         trimWhitespace: Bool
-    ) -> String {
+    ) -> ResponseChannels {
         let openTag = "<think>"
         let closeTag = "</think>"
 
-        var output = ""
+        if !text.localizedCaseInsensitiveContains(openTag),
+           let closeRange = text.range(of: closeTag, options: [.caseInsensitive]) {
+            let reasoning = String(text[..<closeRange.lowerBound])
+            let answer = String(text[closeRange.upperBound...])
+            return ResponseChannels(
+                answer: trimWhitespace ? answer.trimmingCharacters(in: .whitespacesAndNewlines) : answer,
+                reasoning: trimWhitespace ? reasoning.trimmingCharacters(in: .whitespacesAndNewlines) : reasoning
+            )
+        }
+
+        var answer = ""
+        var reasoning = ""
         var index = text.startIndex
         var insideThink = false
 
@@ -153,16 +207,28 @@ struct MLXResponseConverter {
                 }
             }
 
-            if !insideThink {
-                output.append(text[index])
+            if insideThink {
+                reasoning.append(text[index])
+            } else {
+                answer.append(text[index])
             }
             index = text.index(after: index)
         }
 
-        if trimWhitespace {
-            return output.trimmingCharacters(in: .whitespacesAndNewlines)
-        }
-        return output
+        return ResponseChannels(
+            answer: trimWhitespace ? answer.trimmingCharacters(in: .whitespacesAndNewlines) : answer,
+            reasoning: trimWhitespace ? reasoning.trimmingCharacters(in: .whitespacesAndNewlines) : reasoning
+        )
+    }
+
+    private func sanitizeAnswer(_ answer: String) -> String {
+        var result = answer
+        result = stripCodeFenceIfJSON(result)
+        return result.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func sanitizeReasoning(_ reasoning: String) -> String {
+        reasoning.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     // MARK: - Private: Code Fence Stripping
@@ -196,6 +262,21 @@ struct MLXResponseConverter {
             )
         }
         return .toolCalls(Transcript.ToolCalls(id: UUID().uuidString, calls))
+    }
+
+    private func makeResponseSegments(
+        answer: [Transcript.Segment],
+        reasoning: String
+    ) -> [Transcript.Segment] {
+        var segments: [Transcript.Segment] = []
+        if !reasoning.isEmpty {
+            segments.append(.reasoning(.init(content: reasoning)))
+        }
+        segments.append(contentsOf: answer)
+        if segments.isEmpty {
+            return [.text(.init(content: ""))]
+        }
+        return segments
     }
 }
 #endif

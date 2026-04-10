@@ -73,7 +73,7 @@ struct MLXRequestConverterTests {
         #expect(chat[4].content == "Tell me more")
     }
 
-    @Test("Schema appended to system message with hasSchema=true")
+    @Test("Schema produces hasSchema=true and response_schema in additionalContext")
     func schemaInResponseFormat() throws {
         let transcript = Transcript(entries: [
             .instructions(.init(segments: [.text(.init(content: "Return data."))], toolDefinitions: [])),
@@ -89,9 +89,127 @@ struct MLXRequestConverterTests {
 
         #expect(!result.hasTools)
         #expect(result.hasSchema)
+
+        // Schema should be in additionalContext, not in system message text
+        #expect(result.input.additionalContext?["response_schema"] != nil)
+
         let chat = extractChat(from: result.input)
         #expect(chat[0].role == .system)
-        #expect(chat[0].content.contains("Respond with JSON matching this schema:"))
+        #expect(chat[0].content == "Return data.")
+    }
+
+    @Test("Schema additionalContext contains valid JSON Schema string")
+    func schemaAdditionalContextStructure() throws {
+        let schema = GenerationSchema(
+            type: String.self,
+            description: "A structured response",
+            properties: [
+                GenerationSchema.Property(name: "name", description: "A name", type: String.self, guides: []),
+            ]
+        )
+        let transcript = Transcript(entries: [
+            .prompt(
+                .init(
+                    segments: [.text(.init(content: "Generate"))],
+                    responseFormat: .init(schema: schema)
+                )
+            ),
+        ])
+
+        let result = try converter.convert(transcript: transcript, profile: llmProfile())
+
+        let responseSchema = result.input.additionalContext?["response_schema"] as? String
+        #expect(responseSchema != nil)
+        #expect(responseSchema?.contains("\"type\"") == true)
+    }
+
+    @Test("No schema produces no response_schema in additionalContext")
+    func noSchemaNoResponseSchema() throws {
+        let transcript = Transcript(entries: [
+            .instructions(.init(segments: [.text(.init(content: "Be helpful."))], toolDefinitions: [])),
+            .prompt(.init(segments: [.text(.init(content: "Hello"))])),
+        ])
+
+        let result = try converter.convert(transcript: transcript, profile: llmProfile())
+
+        #expect(!result.hasSchema)
+        #expect(result.input.additionalContext?["response_schema"] == nil)
+    }
+
+    @Test("System message stays clean when schema is present")
+    func systemMessageNotPollutedBySchema() throws {
+        let transcript = Transcript(entries: [
+            .instructions(.init(segments: [.text(.init(content: "You are helpful."))], toolDefinitions: [])),
+            .prompt(
+                .init(
+                    segments: [.text(.init(content: "Summarize"))],
+                    responseFormat: .init(schema: GenerationSchema(type: String.self, description: "A summary", properties: []))
+                )
+            ),
+        ])
+
+        let result = try converter.convert(transcript: transcript, profile: llmProfile())
+        let chat = extractChat(from: result.input)
+
+        #expect(chat[0].role == .system)
+        #expect(chat[0].content == "You are helpful.")
+        #expect(!chat[0].content.contains("schema"))
+        #expect(!chat[0].content.contains("JSON"))
+    }
+
+    @Test("Schema JSON string is valid and parseable")
+    func schemaJSONValidity() throws {
+        let schema = GenerationSchema(
+            type: String.self,
+            description: "A note response",
+            properties: [
+                GenerationSchema.Property(name: "summary", description: "A summary", type: String.self, guides: []),
+                GenerationSchema.Property(name: "score", description: "A score", type: Double.self, guides: []),
+            ]
+        )
+        let transcript = Transcript(entries: [
+            .prompt(
+                .init(
+                    segments: [.text(.init(content: "Analyze"))],
+                    responseFormat: .init(schema: schema)
+                )
+            ),
+        ])
+
+        let result = try converter.convert(transcript: transcript, profile: llmProfile())
+
+        let schemaString = try #require(result.input.additionalContext?["response_schema"] as? String)
+
+        // Must be valid JSON
+        let data = Data(schemaString.utf8)
+        let parsed = try #require(try JSONSerialization.jsonObject(with: data) as? [String: Any])
+        #expect(parsed["type"] as? String == "object")
+
+        // Must contain property definitions
+        let properties = try #require(parsed["properties"] as? [String: Any])
+        #expect(properties["summary"] != nil)
+        #expect(properties["score"] != nil)
+    }
+
+    @Test("Schema and tools coexist in additionalContext and tool specs")
+    func schemaAndToolsCoexist() throws {
+        let schema = GenerationSchema(type: String.self, description: "Output", properties: [])
+        let transcript = Transcript(entries: [
+            .instructions(.init(segments: [.text(.init(content: "Use tools."))], toolDefinitions: [searchToolDefinition()])),
+            .prompt(
+                .init(
+                    segments: [.text(.init(content: "Search and format"))],
+                    responseFormat: .init(schema: schema)
+                )
+            ),
+        ])
+
+        let result = try converter.convert(transcript: transcript, profile: llmProfile())
+
+        #expect(result.hasTools)
+        #expect(result.hasSchema)
+        #expect(result.input.tools != nil)
+        #expect(result.input.additionalContext?["response_schema"] != nil)
     }
 
     @Test("Qwen metadata sets enable_thinking=false in additionalContext")
@@ -191,6 +309,7 @@ struct MLXResponseConverterTests {
         )
 
         #expect(extractText(from: entry) == "Hello\nWorld")
+        #expect(extractReasoning(from: entry) == "reasoning")
     }
 
     @Test("Native tool calls take priority over textual detection")
@@ -285,9 +404,33 @@ struct MLXResponseConverterTests {
         let firstDelta = converter.streamDelta(state: &state, chunk: "<think>secret")
         let secondDelta = converter.streamDelta(state: &state, chunk: "</think>Hello")
 
-        #expect(firstDelta.isEmpty)
-        #expect(secondDelta == "Hello")
+        #expect(firstDelta.answer.isEmpty)
+        #expect(firstDelta.reasoning == "secret")
+        #expect(secondDelta.answer == "Hello")
+        #expect(secondDelta.reasoning.isEmpty)
         #expect(!state.emittedVisibleText.contains("secret"))
+        #expect(state.emittedReasoningText == "secret")
+    }
+
+    @Test("Reasoning-only tool syntax does not trigger textual tool detection")
+    func toolDetectionIgnoresReasoningChannel() throws {
+        let entry = try converter.finalEntry(
+            from: [
+                .chunk("<think>{\"tool_calls\":[{\"name\":\"search_repo\",\"arguments\":{\"query\":\"swift\"}}]}</think>"),
+                .chunk("Visible answer"),
+                .info(dummyInfo()),
+            ],
+            hasTools: true,
+            hasSchema: false
+        )
+
+        guard case .response = entry else {
+            Issue.record("Expected response entry")
+            return
+        }
+
+        #expect(extractText(from: entry) == "Visible answer")
+        #expect(extractReasoning(from: entry)?.contains("tool_calls") == true)
     }
 
     @Test("Code fence stripping")
@@ -373,9 +516,23 @@ private func searchToolDefinition() -> Transcript.ToolDefinition {
 
 private func extractText(from entry: Transcript.Entry) -> String? {
     guard case .response(let response) = entry else { return nil }
-    guard response.segments.count == 1 else { return nil }
-    guard case .text(let text) = response.segments[0] else { return nil }
-    return text.content
+    return response.segments.compactMap { segment in
+        if case .text(let text) = segment {
+            return text.content
+        }
+        return nil
+    }.joined()
+}
+
+private func extractReasoning(from entry: Transcript.Entry) -> String? {
+    guard case .response(let response) = entry else { return nil }
+    let reasoning = response.segments.compactMap { segment in
+        if case .reasoning(let text) = segment {
+            return text.content
+        }
+        return nil
+    }.joined()
+    return reasoning.isEmpty ? nil : reasoning
 }
 
 private func extractChat(from input: UserInput) -> [Chat.Message] {

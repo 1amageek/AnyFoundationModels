@@ -27,16 +27,16 @@ let package = Package(
     ],
     dependencies: [
         // Core API
-        .package(url: "https://github.com/1amageek/OpenFoundationModels.git", exact: "1.14.0"),
+        .package(path: "../OpenFoundationModels"),
         // Claude
         .package(url: "https://github.com/apple/swift-configuration.git", from: "1.2.0"),
         // Metal
-        .package(url: "https://github.com/1amageek/swift-lm.git", exact: "0.1.0"),
+        .package(path: "../swift-lm"),
         // MLX
-        .package(url: "https://github.com/ml-explore/mlx-swift-lm.git", from: "2.31.3"),
+        .package(path: "../mlx-swift-lm"),
         .package(
             url: "https://github.com/huggingface/swift-transformers",
-            .upToNextMinor(from: "1.2.0")
+            .upToNextMinor(from: "1.3.0")
         ),
     ],
     targets: [
