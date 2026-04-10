@@ -27,13 +27,16 @@ let package = Package(
     ],
     dependencies: [
         // Core API
-        .package(path: "../OpenFoundationModels"),
+        .package(url: "https://github.com/1amageek/OpenFoundationModels.git", exact: "1.16.0"),
         // Claude
         .package(url: "https://github.com/apple/swift-configuration.git", from: "1.2.0"),
         // Metal
-        .package(path: "../swift-lm"),
+        .package(url: "https://github.com/1amageek/swift-lm.git", exact: "0.2.0"),
         // MLX
-        .package(path: "../mlx-swift-lm"),
+        .package(
+            url: "https://github.com/1amageek/mlx-swift-lm.git",
+            revision: "473673459468695bf1e0892e833d74732d3e8bbf"
+        ),
         .package(
             url: "https://github.com/huggingface/swift-transformers",
             .upToNextMinor(from: "1.3.0")
