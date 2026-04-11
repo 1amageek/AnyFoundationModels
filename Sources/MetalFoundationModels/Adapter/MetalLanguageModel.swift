@@ -12,9 +12,9 @@ public struct MetalLanguageModel: OpenFoundationModels.LanguageModel, Sendable {
 
     private let runtime: MetalLanguageModelRuntime
 
-    public init(modelContainer: ModelContainer, showsThinking: Bool = false) {
+    public init(inferenceSession: InferenceSession, showsThinking: Bool = false) {
         self.runtime = MetalLanguageModelRuntime(
-            modelContainer: modelContainer,
+            inferenceSession: inferenceSession,
             showsThinking: showsThinking
         )
     }

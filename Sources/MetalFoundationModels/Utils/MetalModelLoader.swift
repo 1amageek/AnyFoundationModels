@@ -29,26 +29,26 @@ public final class MetalModelLoader: Sendable {
     /// - Parameters:
     ///   - modelID: HuggingFace repository ID (e.g., "Qwen/Qwen2.5-0.5B-Instruct").
     ///   - progress: Optional progress tracking.
-    /// - Returns: A fully initialized ModelContainer.
+    /// - Returns: A fully initialized InferenceSession.
     public func loadModel(
         _ modelID: String,
         progress: Progress? = nil
-    ) async throws -> ModelContainer {
+    ) async throws -> InferenceSession {
         let key = ModelCacheKey(modelID: modelID)
         if let cached = await cache.get(key) {
             return cached
         }
 
         let loader = ModelBundleLoader()
-        let container: ModelContainer
+        let inferenceSession: InferenceSession
         do {
-            container = try await loader.load(repo: modelID, progress: progress)
+            inferenceSession = try await loader.load(repo: modelID, progress: progress)
         } catch {
             throw MetalModelLoadingError.loadFailed(modelID: modelID, underlyingError: error)
         }
 
-        await cache.set(container, for: key)
-        return container
+        await cache.set(inferenceSession, for: key)
+        return inferenceSession
     }
 
     /// Check if a model is cached.
@@ -66,13 +66,13 @@ public final class MetalModelLoader: Sendable {
 // MARK: - Thread-safe Cache
 
 private actor ModelCache {
-    private var storage: [ModelCacheKey: ModelContainer] = [:]
+    private var storage: [ModelCacheKey: InferenceSession] = [:]
 
-    func get(_ key: ModelCacheKey) -> ModelContainer? {
+    func get(_ key: ModelCacheKey) -> InferenceSession? {
         storage[key]
     }
 
-    func set(_ value: ModelContainer, for key: ModelCacheKey) {
+    func set(_ value: InferenceSession, for key: ModelCacheKey) {
         storage[key] = value
     }
 

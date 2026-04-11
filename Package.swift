@@ -27,11 +27,11 @@ let package = Package(
     ],
     dependencies: [
         // Core API
-        .package(url: "https://github.com/1amageek/OpenFoundationModels.git", exact: "1.16.0"),
+        .package(url: "https://github.com/1amageek/OpenFoundationModels.git", exact: "1.17.0"),
         // Claude
         .package(url: "https://github.com/apple/swift-configuration.git", from: "1.2.0"),
         // Metal
-        .package(url: "https://github.com/1amageek/swift-lm.git", exact: "0.2.0"),
+        .package(url: "https://github.com/1amageek/swift-lm.git", exact: "0.3.0"),
         // MLX
         .package(
             url: "https://github.com/1amageek/mlx-swift-lm.git",
@@ -130,6 +130,20 @@ let package = Package(
         ),
 
         // ===== Tests =====
+        .testTarget(
+            name: "MetalFoundationModelsTests",
+            dependencies: [
+                .target(name: "MetalFoundationModels", condition: .when(traits: ["Metal"])),
+                .product(name: "OpenFoundationModels", package: "OpenFoundationModels",
+                         condition: .when(traits: ["Metal"])),
+                .product(name: "SwiftLM", package: "swift-lm",
+                         condition: .when(traits: ["Metal"])),
+            ],
+            swiftSettings: [
+                .swiftLanguageMode(.v6),
+                .define("METAL_ENABLED", .when(traits: ["Metal"])),
+            ]
+        ),
         .testTarget(
             name: "OllamaFoundationModelsTests",
             dependencies: [

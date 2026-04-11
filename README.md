@@ -2,7 +2,7 @@
 
 A unified Swift framework for interacting with multiple language model providers through a single, protocol-based API.
 
-Write against the `LanguageModel` protocol and use **Ollama**, **Claude**, **OpenAI Responses API**, and **on-device MLX** — side by side in the same application.
+Write against the `LanguageModel` protocol and use **Ollama**, **Claude**, **OpenAI Responses API**, **on-device MLX**, and **on-device Metal via swift-lm** side by side in the same application.
 
 ## Features
 
@@ -11,6 +11,7 @@ Write against the `LanguageModel` protocol and use **Ollama**, **Claude**, **Ope
 - **Tool calling** with automatic execution loop
 - **Streaming** responses with partial content parsing
 - **Swift 6 concurrency** — fully `Sendable`, `async`/`await` native
+- **On-device backends** for both MLX and direct Metal inference
 - **Trait-gated compilation** — keep package size small by compiling only the backends you need
 
 ## Requirements
@@ -44,6 +45,8 @@ targets: [
                      condition: .when(traits: ["Ollama"])),
             .product(name: "MLXFoundationModels", package: "AnyFoundationModels",
                      condition: .when(traits: ["MLX"])),
+            .product(name: "MetalFoundationModels", package: "AnyFoundationModels",
+                     condition: .when(traits: ["Metal"])),
         ]
     )
 ]
@@ -52,7 +55,7 @@ targets: [
 Build with the traits you need:
 
 ```bash
-swift build --traits Claude,Response,Ollama
+swift build --traits Claude,Response,Ollama,Metal
 ```
 
 ## Quick Start

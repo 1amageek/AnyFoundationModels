@@ -18,11 +18,11 @@ actor MetalLanguageModelRuntime {
         }
     }
 
-    private let modelContainer: ModelContainer
+    private let inferenceSession: InferenceSession
     private let showsThinking: Bool
 
-    init(modelContainer: ModelContainer, showsThinking: Bool) {
-        self.modelContainer = modelContainer
+    init(inferenceSession: InferenceSession, showsThinking: Bool) {
+        self.inferenceSession = inferenceSession
         self.showsThinking = showsThinking
     }
 
@@ -35,19 +35,19 @@ actor MetalLanguageModelRuntime {
         let parameters = convertOptions(options)
         let input = ModelInput(
             chat: messages,
-            promptOptions: PromptPreparationOptions(thinkingEnabled: showsThinking)
+            promptOptions: PromptPreparationOptions(isThinkingEnabled: showsThinking)
         )
 
         var answerText = ""
         var reasoningText = ""
-        let stream = try await modelContainer.generate(input: input, parameters: parameters)
+        let stream = try await inferenceSession.generate(input, parameters: parameters)
         for await generation in stream {
             switch generation {
-            case .chunk(let chunk):
+            case .text(let chunk):
                 answerText += chunk
-            case .reasoningChunk(let chunk):
+            case .reasoning(let chunk):
                 reasoningText += chunk
-            case .info:
+            case .completed:
                 break
             }
         }
@@ -70,24 +70,24 @@ actor MetalLanguageModelRuntime {
                     let parameters = self.convertOptions(options)
                     let input = ModelInput(
                         chat: messages,
-                        promptOptions: PromptPreparationOptions(thinkingEnabled: self.showsThinking)
+                        promptOptions: PromptPreparationOptions(isThinkingEnabled: self.showsThinking)
                     )
 
-                    let generationStream = try await self.modelContainer.generate(
-                        input: input,
+                    let generationStream = try await self.inferenceSession.generate(
+                        input,
                         parameters: parameters
                     )
                     for await generation in generationStream {
                         switch generation {
-                        case .chunk(let chunk):
+                        case .text(let chunk):
                             continuation.yield(
                                 .response(.init(assetIDs: [], segments: [.text(.init(content: chunk))]))
                             )
-                        case .reasoningChunk(let chunk):
+                        case .reasoning(let chunk):
                             continuation.yield(
                                 .response(.init(assetIDs: [], segments: [.reasoning(.init(content: chunk))]))
                             )
-                        case .info:
+                        case .completed:
                             break
                         }
                     }
@@ -169,9 +169,9 @@ actor MetalLanguageModelRuntime {
         }.joined()
     }
 
-    private func convertOptions(_ options: GenerationOptions?) -> GenerateParameters {
-        var params = GenerateParameters(temperature: 0)
-        params.thinking = showsThinking ? .separate : .hidden
+    private func convertOptions(_ options: GenerationOptions?) -> GenerationParameters {
+        var params = GenerationParameters(temperature: 0)
+        params.reasoning = showsThinking ? .separate : .hidden
         if let options {
             if let temperature = options.temperature {
                 params.temperature = Float(temperature)
