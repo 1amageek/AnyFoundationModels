@@ -25,7 +25,7 @@ Add to your `Package.swift`:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/1amageek/AnyFoundationModels.git", from: "0.2.0"),
+    .package(url: "https://github.com/1amageek/AnyFoundationModels.git", from: "0.3.0"),
 ]
 ```
 
