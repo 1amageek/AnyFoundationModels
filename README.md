@@ -17,7 +17,7 @@ Write against the `LanguageModel` protocol and use **Ollama**, **Claude**, **Ope
 ## Requirements
 
 - Swift 6.2+
-- macOS 15+ / iOS 18+ / visionOS 2+
+- macOS 26+ / iOS 26+ / visionOS 26+
 
 ## Installation
 
@@ -25,7 +25,7 @@ Add to your `Package.swift`:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/1amageek/AnyFoundationModels.git", from: "0.3.0"),
+    .package(url: "https://github.com/1amageek/AnyFoundationModels.git", from: "0.4.0"),
 ]
 ```
 
@@ -219,6 +219,37 @@ let descriptor = MLXModelDescriptor(
 let model = try await factory.makeLanguageModel(descriptor: descriptor)
 ```
 
+### Metal via `swift-lm` (On-Device)
+
+```swift
+import MetalFoundationModels
+import OpenFoundationModels
+
+let loader = MetalModelLoader()
+let container = try await loader.load(repo: "Qwen/Qwen2.5-0.5B-Instruct")
+let model = MetalLanguageModel(container: container)
+let session = LanguageModelSession(model: model)
+
+let response = try await session.respond(to: "Explain Swift concurrency briefly.")
+print(response.content)
+```
+
+Load from a local model directory:
+
+```swift
+let directory = URL(fileURLWithPath: "/path/to/local/model")
+let container = try await loader.load(directory: directory)
+let model = MetalLanguageModel(container: container, showsThinking: true)
+```
+
+Metal backend support currently includes:
+
+- Text generation
+- Structured output
+- Tool calling via textual tool-call detection
+- Streaming deltas
+- Multimodal prompts when the loaded `swift-lm` bundle reports image capability
+
 ## Using Multiple Backends
 
 All backends conform to `LanguageModel`, so you can use them side by side in the same application:
@@ -256,7 +287,7 @@ async let review = session2.respond(to: "Review this function: ...")
 │              LanguageModel Protocol                   │
 │        generate() / stream() / isAvailable            │
 ├──────────┬──────────┬──────────┬────────────────────┤
-│  Claude  │ Response │  Ollama  │        MLX          │
+│  Claude  │ Response │  Ollama  │    MLX / Metal      │
 │  (API)   │  (API)   │ (Local)  │    (On-Device)      │
 └──────────┴──────────┴──────────┴────────────────────┘
 ```
@@ -273,6 +304,7 @@ async let review = session2.respond(to: "Review this function: ...")
 | `ResponseFoundationModels` | OpenAI Responses API backend |
 | `OllamaFoundationModels` | Ollama local server backend |
 | `MLXFoundationModels` | Apple MLX on-device inference backend |
+| `MetalFoundationModels` | `swift-lm` direct Metal inference backend |
 
 ## License
 
