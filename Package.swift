@@ -51,6 +51,7 @@ let package = Package(
             name: "AnyFoundationModelsSupport",
             dependencies: [
                 .product(name: "OpenFoundationModels", package: "OpenFoundationModels"),
+                .product(name: "OpenFoundationModelsExtra", package: "OpenFoundationModels"),
             ],
             swiftSettings: [
                 .swiftLanguageMode(.v6),

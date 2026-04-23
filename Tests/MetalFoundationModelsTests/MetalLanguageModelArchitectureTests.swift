@@ -62,11 +62,14 @@ struct MetalRequestConverterTests {
         #expect(chat[0].role == .system)
         #expect(chat[1].role == .user)
         #expect(chat[2].role == .assistant)
-        let toolCallText = extractText(from: chat[2].content)
-        #expect(toolCallText.hasPrefix("search_repo("))
-        #expect(toolCallText.contains(#""query""#))
-        #expect(toolCallText.contains(#""swift""#))
+        let toolCalls = try #require(chat[2].toolCalls)
+        #expect(toolCalls.count == 1)
+        #expect(toolCalls[0].id == "call-1")
+        #expect(toolCalls[0].function.name == "search_repo")
+        #expect(toolCalls[0].function.arguments.contains(#""query""#))
+        #expect(toolCalls[0].function.arguments.contains(#""swift""#))
         #expect(chat[3].role == .tool)
+        #expect(chat[3].toolCallID == "call-1")
         #expect(extractText(from: chat[3].content) == "Found 3 results")
         #expect(chat[4].role == .user)
         #expect(extractText(from: chat[4].content) == "Tell me more")
@@ -106,8 +109,8 @@ struct MetalRequestConverterTests {
         #expect(systemText.contains("\"summary\""))
     }
 
-    @Test("Tool definitions are rendered into the system message")
-    func toolDefinitionsInSystemMessage() async throws {
+    @Test("Tool definitions are carried via ModelInput.tools, not embedded in system text")
+    func toolDefinitionsInModelInputTools() async throws {
         let transcript = Transcript(entries: [
             .instructions(.init(segments: [.text(.init(content: "Use tools."))], toolDefinitions: [searchToolDefinition()])),
             .prompt(.init(segments: [.text(.init(content: "Search"))])),
@@ -119,14 +122,19 @@ struct MetalRequestConverterTests {
             showsThinking: false
         )
 
+        let tools = try #require(result.input.tools)
+        #expect(tools.count == 1)
+        #expect(tools[0].function.name == "search_repo")
+        #expect(tools[0].function.description == "Search the repository")
+
         let chat = extractChat(from: result.input)
         let systemText = extractText(from: chat[0].content)
-        #expect(systemText.contains("tool_calls"))
-        #expect(systemText.contains("search_repo"))
-        #expect(systemText.contains("Parameters schema"))
+        #expect(!systemText.contains("tool_calls"))
+        #expect(!systemText.contains("search_repo"))
+        #expect(!systemText.contains("Parameters schema"))
     }
 
-    @Test("Metal strips session-generated tool appendix before adding searched tools")
+    @Test("Metal strips session-generated tool appendix from system text")
     func stripsGeneratedToolInstructions() async throws {
         let transcript = Transcript(entries: [
             .instructions(.init(
@@ -150,10 +158,12 @@ struct MetalRequestConverterTests {
         #expect(systemText.contains("Use tools."))
         #expect(!systemText.contains("# Tools"))
         #expect(!systemText.contains("In this environment you have access"))
-        #expect(systemText.contains("search_repo"))
+
+        let tools = try #require(result.input.tools)
+        #expect(tools.contains { $0.function.name == "search_repo" })
     }
 
-    @Test("All tool definitions are rendered into system message")
+    @Test("All tool definitions are carried via ModelInput.tools")
     func allToolDefinitionsRendered() async throws {
         let transcript = Transcript(entries: [
             .instructions(.init(
@@ -173,11 +183,11 @@ struct MetalRequestConverterTests {
             showsThinking: false
         )
 
-        let chat = extractChat(from: result.input)
-        let systemText = extractText(from: chat[0].content)
-        #expect(systemText.contains("Tool name: search_repo"))
-        #expect(systemText.contains("Tool name: fetch_docs"))
-        #expect(systemText.contains("Tool name: open_issue"))
+        let tools = try #require(result.input.tools)
+        let names = tools.map(\.function.name)
+        #expect(names.contains("search_repo"))
+        #expect(names.contains("fetch_docs"))
+        #expect(names.contains("open_issue"))
     }
 
     @Test("Base64 image is converted to InputImage data")

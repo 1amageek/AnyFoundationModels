@@ -38,7 +38,6 @@ struct MetalRequestConverter {
         var messages: [InputMessage] = []
         if let systemMessage = try buildSystemMessage(
             from: resolved,
-            toolDefinitions: resolved.toolDefinitions,
             responseSchema: responseSchema
         ) {
             messages.append(.system(systemMessage))
@@ -62,24 +61,23 @@ struct MetalRequestConverter {
                     messages.append(.assistant(text))
                 }
             case .tool(let interaction):
-                let callText = interaction.calls
-                    .map { "\($0.toolName)(\($0.arguments.jsonString))" }
-                    .joined(separator: "\n")
-                if !callText.isEmpty {
-                    messages.append(.assistant(callText))
+                let toolCalls = buildToolCalls(from: interaction.calls)
+                if !toolCalls.isEmpty {
+                    messages.append(.assistant("", toolCalls: toolCalls))
                 }
                 for output in interaction.outputs {
                     let text = segmentsToText(output.segments)
-                    if !text.isEmpty {
-                        messages.append(.tool(text))
-                    }
+                    messages.append(.tool(text, toolCallID: output.id))
                 }
             }
         }
 
+        let toolDefinitions = try buildToolDefinitions(resolved.toolDefinitions)
+
         return ConvertedRequest(
             input: ModelInput(
                 chat: messages,
+                tools: toolDefinitions,
                 promptOptions: PromptPreparationOptions(isThinkingEnabled: showsThinking)
             ),
             hasTools: !resolved.toolDefinitions.isEmpty,
@@ -89,7 +87,6 @@ struct MetalRequestConverter {
 
     private func buildSystemMessage(
         from resolved: ResolvedTranscript,
-        toolDefinitions: [Transcript.ToolDefinition],
         responseSchema: GenerationSchema?
     ) throws -> String? {
         var sections: [String] = []
@@ -108,10 +105,6 @@ struct MetalRequestConverter {
             sections.append(instructionText.joined(separator: "\n\n"))
         }
 
-        if let toolInstructions = try buildToolInstructions(toolDefinitions) {
-            sections.append(toolInstructions)
-        }
-
         if let responseSchema {
             sections.append(
                 """
@@ -127,29 +120,46 @@ struct MetalRequestConverter {
         return sections.joined(separator: "\n\n")
     }
 
-    private func buildToolInstructions(
-        _ toolDefinitions: [Transcript.ToolDefinition]
-    ) throws -> String? {
-        guard !toolDefinitions.isEmpty else {
+    private func buildToolDefinitions(
+        _ definitions: [Transcript.ToolDefinition]
+    ) throws -> [ToolDefinition]? {
+        guard !definitions.isEmpty else { return nil }
+
+        return try definitions.map { definition in
+            let parameters = try encodeToolParameters(definition.parameters)
+            return ToolDefinition(
+                function: .init(
+                    name: definition.name,
+                    description: definition.description,
+                    parameters: parameters
+                )
+            )
+        }
+    }
+
+    private func buildToolCalls(
+        from calls: Transcript.ToolCalls
+    ) -> [InputMessage.ToolCall] {
+        calls.map { call in
+            InputMessage.ToolCall(
+                id: call.id,
+                function: .init(
+                    name: call.toolName,
+                    arguments: call.arguments.jsonString
+                )
+            )
+        }
+    }
+
+    private func encodeToolParameters(
+        _ schema: GenerationSchema
+    ) throws -> [String: any Sendable]? {
+        let data = try JSONEncoder().encode(schema)
+        let jsonValue = try JSONDecoder().decode(JSONValue.self, from: data)
+        guard case .object(let dict) = jsonValue else {
             return nil
         }
-
-        var lines: [String] = [
-            """
-            If a tool is required, respond with JSON containing a top-level "tool_calls" array. \
-            Each item must include "name" and "arguments". Use only the tools defined below.
-            """
-        ]
-
-        for definition in toolDefinitions {
-            lines.append("Tool name: \(definition.name)")
-            if !definition.description.isEmpty {
-                lines.append("Description: \(definition.description)")
-            }
-            lines.append("Parameters schema: \(try encodeSchemaString(definition.parameters))")
-        }
-
-        return lines.joined(separator: "\n")
+        return dict.mapValues(\.sendableValue)
     }
 
     private func convertPromptSegments(

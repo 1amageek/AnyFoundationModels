@@ -5,6 +5,8 @@ import MLXLMCommon
 import OpenFoundationModels
 import OpenFoundationModelsExtra
 
+private typealias SchemaJSONValue = OpenFoundationModelsExtra.JSONValue
+
 /// Stateless converter: Transcript → UserInput for MLX on-device inference.
 struct MLXRequestConverter {
     enum ConversionError: LocalizedError {
@@ -156,8 +158,8 @@ struct MLXRequestConverter {
         _ parameters: GenerationSchema
     ) throws -> any Sendable {
         let data = try JSONEncoder().encode(parameters)
-        let jsonValue = try JSONDecoder().decode(MLXLMCommon.JSONValue.self, from: data)
-        return sendableValue(for: jsonValue)
+        let jsonValue = try JSONDecoder().decode(SchemaJSONValue.self, from: data)
+        return jsonValue.sendableValue
     }
 
     private func encodeSchemaString(_ schema: GenerationSchema) -> String? {
@@ -169,25 +171,6 @@ struct MLXRequestConverter {
         } catch {
             Logger.warning("[MLXRequestConverter] Failed to encode response schema: \(error)")
             return nil
-        }
-    }
-
-    private func sendableValue(for jsonValue: MLXLMCommon.JSONValue) -> any Sendable {
-        switch jsonValue {
-        case .null:
-            return Optional<String>.none as any Sendable
-        case .bool(let value):
-            return value
-        case .int(let value):
-            return value
-        case .double(let value):
-            return value
-        case .string(let value):
-            return value
-        case .array(let values):
-            return values.map(sendableValue(for:)) as [any Sendable]
-        case .object(let values):
-            return values.mapValues(sendableValue(for:)) as [String: any Sendable]
         }
     }
 
