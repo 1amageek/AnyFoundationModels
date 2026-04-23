@@ -5,13 +5,29 @@ import SwiftLM
 
 /// Orchestrates Metal inference using swift-lm.
 actor MetalLanguageModelRuntime {
-    private let container: LanguageModelContainer
+    private let configuration: ModelConfiguration
+    private let generateStream:
+        @Sendable (ModelInput, GenerationParameters) async throws -> AsyncStream<GenerationEvent>
     private let showsThinking: Bool
     private let requestConverter = MetalRequestConverter()
     private let responseConverter = MetalResponseConverter()
 
     init(container: LanguageModelContainer, showsThinking: Bool) {
-        self.container = container
+        self.configuration = container.configuration
+        self.generateStream = { input, parameters in
+            try await container.generate(input, parameters: parameters)
+        }
+        self.showsThinking = showsThinking
+    }
+
+    init(
+        configuration: ModelConfiguration,
+        showsThinking: Bool,
+        generateStream: @escaping
+            @Sendable (ModelInput, GenerationParameters) async throws -> AsyncStream<GenerationEvent>
+    ) {
+        self.configuration = configuration
+        self.generateStream = generateStream
         self.showsThinking = showsThinking
     }
 
@@ -22,11 +38,11 @@ actor MetalLanguageModelRuntime {
     ) async throws -> Transcript.Entry {
         let request = try await requestConverter.convert(
             transcript: transcript,
-            configuration: container.configuration,
+            configuration: configuration,
             showsThinking: showsThinking
         )
         let parameters = Self.makeParameters(options: options, showsThinking: showsThinking)
-        let stream = try await container.generate(request.input, parameters: parameters)
+        let stream = try await generateStream(request.input, parameters)
 
         var generations: [GenerationEvent] = []
         for await generation in stream {
@@ -50,60 +66,51 @@ actor MetalLanguageModelRuntime {
                 do {
                     let request = try await self.requestConverter.convert(
                         transcript: transcript,
-                        configuration: self.container.configuration,
+                        configuration: self.configuration,
                         showsThinking: self.showsThinking
                     )
                     let parameters = Self.makeParameters(
                         options: options,
                         showsThinking: self.showsThinking
                     )
-                    let generationStream = try await self.container.generate(
+                    let generationStream = try await self.generateStream(
                         request.input,
-                        parameters: parameters
+                        parameters
                     )
 
-                    if request.hasTools {
-                        var buffered: [GenerationEvent] = []
-                        for await generation in generationStream {
-                            try Task.checkCancellation()
-                            buffered.append(generation)
-                        }
+                    var buffered: [GenerationEvent] = []
+                    var streamingState = MetalResponseConverter.StreamingState()
+                    var hasYieldedResponseEntry = false
 
-                        let entry = try self.responseConverter.finalEntry(
-                            from: buffered,
-                            hasTools: request.hasTools,
-                            hasSchema: request.hasSchema
+                    for await generation in generationStream {
+                        try Task.checkCancellation()
+                        buffered.append(generation)
+                        let deltas = self.responseConverter.streamDelta(
+                            state: &streamingState,
+                            event: generation
                         )
-                        continuation.yield(entry)
-                    } else {
-                        var buffered: [GenerationEvent] = []
-                        var streamingState = MetalResponseConverter.StreamingState()
-                        var hasYieldedEntry = false
-
-                        for await generation in generationStream {
-                            try Task.checkCancellation()
-                            buffered.append(generation)
-                            let deltas = self.responseConverter.streamDelta(
-                                state: &streamingState,
-                                event: generation
-                            )
-                            if let entry = self.responseConverter.streamEntry(
-                                answer: deltas.answer,
-                                reasoning: deltas.reasoning
-                            ) {
-                                continuation.yield(entry)
-                                hasYieldedEntry = true
-                            }
-                        }
-
-                        if !hasYieldedEntry {
-                            let entry = try self.responseConverter.finalEntry(
-                                from: buffered,
-                                hasTools: request.hasTools,
-                                hasSchema: request.hasSchema
-                            )
+                        if let entry = self.responseConverter.streamEntry(
+                            answer: deltas.answer,
+                            reasoning: deltas.reasoning
+                        ) {
                             continuation.yield(entry)
+                            hasYieldedResponseEntry = true
                         }
+                    }
+
+                    let finalEntry = try self.responseConverter.finalEntry(
+                        from: buffered,
+                        hasTools: request.hasTools,
+                        hasSchema: request.hasSchema
+                    )
+
+                    switch finalEntry {
+                    case .toolCalls:
+                        continuation.yield(finalEntry)
+                    case .response where !hasYieldedResponseEntry:
+                        continuation.yield(finalEntry)
+                    default:
+                        break
                     }
 
                     continuation.finish()

@@ -1,4 +1,5 @@
 #if RESPONSE_ENABLED
+import AnyFoundationModelsSupport
 import Foundation
 import OpenFoundationModels
 import OpenFoundationModelsExtra
@@ -69,7 +70,9 @@ internal struct ResponseRequestBuilder: OpenFoundationModelsExtra.RequestBuilder
         for entry in resolved {
             switch entry {
             case .instructions(let i):
-                let text = segmentsToText(i.segments)
+                let text = segmentsToText(
+                    SessionToolInstructions.userAuthoredSegments(from: i.segments)
+                )
                 if !text.isEmpty {
                     items.append(.message(MessageItem(role: "system", content: text)))
                 }

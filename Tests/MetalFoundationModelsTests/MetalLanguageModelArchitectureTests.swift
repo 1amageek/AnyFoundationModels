@@ -126,6 +126,60 @@ struct MetalRequestConverterTests {
         #expect(systemText.contains("Parameters schema"))
     }
 
+    @Test("Metal strips session-generated tool appendix before adding searched tools")
+    func stripsGeneratedToolInstructions() async throws {
+        let transcript = Transcript(entries: [
+            .instructions(.init(
+                segments: [
+                    .text(.init(content: "Use tools.")),
+                    .text(.init(content: generatedToolInstructions())),
+                ],
+                toolDefinitions: [searchToolDefinition()]
+            )),
+            .prompt(.init(segments: [.text(.init(content: "Search"))])),
+        ])
+
+        let result = try await converter.convert(
+            transcript: transcript,
+            configuration: textModelConfiguration(),
+            showsThinking: false
+        )
+
+        let chat = extractChat(from: result.input)
+        let systemText = extractText(from: chat[0].content)
+        #expect(systemText.contains("Use tools."))
+        #expect(!systemText.contains("# Tools"))
+        #expect(!systemText.contains("In this environment you have access"))
+        #expect(systemText.contains("search_repo"))
+    }
+
+    @Test("All tool definitions are rendered into system message")
+    func allToolDefinitionsRendered() async throws {
+        let transcript = Transcript(entries: [
+            .instructions(.init(
+                segments: [.text(.init(content: "Use tools when needed."))],
+                toolDefinitions: [
+                    searchToolDefinition(),
+                    fetchDocsToolDefinition(),
+                    openIssueToolDefinition(),
+                ]
+            )),
+            .prompt(.init(segments: [.text(.init(content: "Search the repository for Metal stream code"))])),
+        ])
+
+        let result = try await converter.convert(
+            transcript: transcript,
+            configuration: textModelConfiguration(),
+            showsThinking: false
+        )
+
+        let chat = extractChat(from: result.input)
+        let systemText = extractText(from: chat[0].content)
+        #expect(systemText.contains("Tool name: search_repo"))
+        #expect(systemText.contains("Tool name: fetch_docs"))
+        #expect(systemText.contains("Tool name: open_issue"))
+    }
+
     @Test("Base64 image is converted to InputImage data")
     func base64ImagePrompt() async throws {
         let png = samplePNGData()
@@ -367,6 +421,43 @@ struct MetalParameterTests {
     }
 }
 
+@Suite("Metal Runtime Streaming Tests")
+struct MetalRuntimeStreamingTests {
+    @Test("Tool-enabled text responses still stream incrementally")
+    func toolEnabledTextResponseStreamsIncrementally() async throws {
+        let transcript = Transcript(entries: [
+            .instructions(.init(
+                segments: [.text(.init(content: "Use tools when needed."))],
+                toolDefinitions: [searchToolDefinition()]
+            )),
+            .prompt(.init(segments: [.text(.init(content: "Say hello"))])),
+        ])
+
+        let runtime = MetalLanguageModelRuntime(
+            configuration: textModelConfiguration(),
+            showsThinking: false,
+            generateStream: { _, _ in
+                AsyncStream { continuation in
+                    continuation.yield(.text("Hel"))
+                    continuation.yield(.text("lo"))
+                    continuation.yield(.completed(dummyCompletionInfo()))
+                    continuation.finish()
+                }
+            }
+        )
+
+        let stream = await runtime.stream(transcript: transcript, options: nil)
+        var entries: [Transcript.Entry] = []
+        for try await entry in stream {
+            entries.append(entry)
+        }
+
+        #expect(entries.count == 2)
+        #expect(extractResponseText(from: entries[0]) == "Hel")
+        #expect(extractResponseText(from: entries[1]) == "lo")
+    }
+}
+
 private func textModelConfiguration() -> ModelConfiguration {
     ModelConfiguration(
         name: "text-model",
@@ -397,6 +488,30 @@ private func searchToolDefinition() -> Transcript.ToolDefinition {
         description: "Search the repository",
         parameters: GenerationSchema(type: String.self, description: "Search query", properties: [])
     )
+}
+
+private func fetchDocsToolDefinition() -> Transcript.ToolDefinition {
+    Transcript.ToolDefinition(
+        name: "fetch_docs",
+        description: "Fetch API documentation",
+        parameters: GenerationSchema(type: String.self, description: "Documentation path", properties: [])
+    )
+}
+
+private func openIssueToolDefinition() -> Transcript.ToolDefinition {
+    Transcript.ToolDefinition(
+        name: "open_issue",
+        description: "Open a GitHub issue",
+        parameters: GenerationSchema(type: String.self, description: "Issue title", properties: [])
+    )
+}
+
+private func generatedToolInstructions() -> String {
+    """
+    # Tools
+
+    In this environment you have access to a set of tools you can use to answer the user's question.
+    """
 }
 
 private func extractChat(from input: ModelInput) -> [InputMessage] {

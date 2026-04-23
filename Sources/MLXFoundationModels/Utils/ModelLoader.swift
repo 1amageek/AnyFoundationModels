@@ -1,9 +1,11 @@
 #if MLX_ENABLED
 import Foundation
-import Hub
+import HuggingFace
+import MLXHuggingFace
 import MLXLLM
 import MLXLMCommon
 import MLXVLM
+import Tokenizers
 
 public enum MLXModelLoadingError: LocalizedError {
     case loadFailed(modelID: String, underlyingError: Error)
@@ -87,14 +89,18 @@ public actor ModelLoader {
         let task: Task<MLXLoadedModel, Error>
     }
 
-    private let hubApi: HubApi
+    private let hubClient: HubClient
+    private let downloader: any Downloader
+    private let tokenizerLoader: any TokenizerLoader
     private var loadedModels: [String: MLXLoadedModel] = [:]
     private var resolvedArtifacts: [String: URL] = [:]
     private var inflightArtifacts: [String: InflightArtifact] = [:]
     private var inflightLoads: [String: InflightLoad] = [:]
 
-    public init(hubApi: HubApi = HubApi()) {
-        self.hubApi = hubApi
+    public init(hubClient: HubClient = HubClient()) {
+        self.hubClient = hubClient
+        self.downloader = #hubDownloader(hubClient)
+        self.tokenizerLoader = #huggingFaceTokenizerLoader()
     }
 
     public func loadModel(
@@ -120,12 +126,13 @@ public actor ModelLoader {
             return try await inflight.task.value
         }
 
+        let downloader = self.downloader
+        let tokenizerLoader = self.tokenizerLoader
         let inflightID = UUID()
-        let task = Task { [hubApi] () async throws -> MLXLoadedModel in
+        let task = Task { () async throws -> MLXLoadedModel in
             let directory = try await self.artifactDirectory(
                 for: artifact,
                 progress: progress,
-                hubApi: hubApi,
                 statusHandler: statusHandler
             )
             let profile = try Self.resolveProfile(
@@ -138,7 +145,8 @@ public actor ModelLoader {
                 await self.emit(.loadingWeights(modelID: artifact.modelID), to: statusHandler)
                 container = try await Self.loadModelContainer(
                     for: profile,
-                    hubApi: hubApi,
+                    downloader: downloader,
+                    tokenizerLoader: tokenizerLoader,
                     directory: directory
                 )
             } catch {
@@ -181,7 +189,6 @@ public actor ModelLoader {
         return try await artifactDirectory(
             for: artifact,
             progress: progress,
-            hubApi: hubApi,
             statusHandler: statusHandler
         )
     }
@@ -223,8 +230,8 @@ public actor ModelLoader {
         switch artifact.source {
         case .local(let directory):
             return Self.isUsableModelDirectory(directory)
-        case .remote(let configuration):
-            return Self.isUsableModelDirectory(configuration.modelDirectory(hub: hubApi))
+        case .remote:
+            return false
         }
     }
 
@@ -234,26 +241,30 @@ public actor ModelLoader {
 
     private static func loadModelContainer(
         for profile: MLXModelProfile,
-        hubApi: HubApi,
+        downloader: any Downloader,
+        tokenizerLoader: any TokenizerLoader,
         directory: URL
     ) async throws -> ModelContainer {
         let configuration = ModelConfiguration(directory: directory)
         switch profile.runtimeFamily {
         case .vlm:
             return try await VLMModelFactory.shared.loadContainer(
-                hub: hubApi,
+                from: downloader,
+                using: tokenizerLoader,
                 configuration: configuration
             ) { _ in }
         case .llm:
             return try await LLMModelFactory.shared.loadContainer(
-                hub: hubApi,
+                from: downloader,
+                using: tokenizerLoader,
                 configuration: configuration
             ) { _ in }
         case .unknown:
             return try await MLXLMCommon.loadModelContainer(
-                hub: hubApi,
-                directory: directory
-            ) { _ in }
+                from: downloader,
+                using: tokenizerLoader,
+                configuration: configuration
+            )
         }
     }
 
@@ -309,24 +320,11 @@ public actor ModelLoader {
     private func artifactDirectory(
         for artifact: ArtifactReference,
         progress: Progress?,
-        hubApi: HubApi,
         statusHandler: MLXModelLoadingStatusHandler?
     ) async throws -> URL {
         await emit(.checkingCache(modelID: artifact.modelID), to: statusHandler)
         if let resolved = resolvedArtifacts[artifact.cacheKey],
            Self.isUsableModelDirectory(resolved) {
-            if case .remote(let configuration) = artifact.source,
-               try await Self.shouldFetchSupplementalPromptAssets(
-                   for: artifact.modelID,
-                   directory: resolved,
-                   configuration: configuration,
-                   hubApi: hubApi
-               ) {
-                _ = try await MLXLMCommon.downloadModel(
-                    hub: hubApi,
-                    configuration: configuration
-                ) { _ in }
-            }
             progress?.completedUnitCount = progress?.totalUnitCount ?? 1
             progress?.localizedDescription = NSLocalizedString("Using cached model artifact", comment: "")
             await emit(.usingDiskCache(modelID: artifact.modelID), to: statusHandler)
@@ -338,11 +336,12 @@ public actor ModelLoader {
             return try await inflight.task.value
         }
 
+        let downloader = self.downloader
         let inflightID = UUID()
         let task = Task { () async throws -> URL in
             try await Self.resolveArtifactDirectory(
                 artifact,
-                hubApi: hubApi,
+                downloader: downloader,
                 progress: progress,
                 statusHandler: statusHandler
             )
@@ -374,7 +373,7 @@ public actor ModelLoader {
 
     private static func resolveArtifactDirectory(
         _ artifact: ArtifactReference,
-        hubApi: HubApi,
+        downloader: any Downloader,
         progress: Progress?,
         statusHandler: MLXModelLoadingStatusHandler?
     ) async throws -> URL {
@@ -388,25 +387,6 @@ public actor ModelLoader {
             await emit(.usingDiskCache(modelID: artifact.modelID), to: statusHandler)
             return directory
         case .remote(let configuration):
-            let directory = configuration.modelDirectory(hub: hubApi)
-            if isUsableModelDirectory(directory) {
-                if try await shouldFetchSupplementalPromptAssets(
-                    for: artifact.modelID,
-                    directory: directory,
-                    configuration: configuration,
-                    hubApi: hubApi
-                ) {
-                    _ = try await MLXLMCommon.downloadModel(
-                        hub: hubApi,
-                        configuration: configuration
-                    ) { _ in }
-                }
-                progress?.completedUnitCount = progress?.totalUnitCount ?? 1
-                progress?.localizedDescription = NSLocalizedString("Using downloaded model snapshot", comment: "")
-                await emit(.usingDiskCache(modelID: artifact.modelID), to: statusHandler)
-                return directory
-            }
-
             progress?.localizedDescription = NSLocalizedString("Downloading model", comment: "")
             await emit(
                 .downloading(
@@ -436,9 +416,10 @@ public actor ModelLoader {
                 }
             }
             do {
-                let resolvedDirectory = try await MLXLMCommon.downloadModel(
-                    hub: hubApi,
-                    configuration: configuration
+                let resolved = try await MLXLMCommon.resolve(
+                    configuration: configuration,
+                    from: downloader,
+                    useLatest: false
                 ) { hubProgress in
                     heartbeatState.markProgressReceived()
                     progress?.totalUnitCount = hubProgress.totalUnitCount
@@ -468,7 +449,7 @@ public actor ModelLoader {
                 }
                 heartbeatState.finish()
                 heartbeatTask.cancel()
-                return resolvedDirectory
+                return resolved.modelDirectory
             } catch {
                 heartbeatState.finish()
                 heartbeatTask.cancel()
@@ -593,23 +574,6 @@ public actor ModelLoader {
         }
 
         return false
-    }
-
-    private static func shouldFetchSupplementalPromptAssets(
-        for modelID: String,
-        directory: URL,
-        configuration: ModelConfiguration,
-        hubApi: HubApi
-    ) async throws -> Bool {
-        guard modelID.lowercased().contains("gemma-4") else {
-            return false
-        }
-        if FileManager.default.fileExists(
-            atPath: directory.appendingPathComponent("chat_template.jinja").path
-        ) {
-            return false
-        }
-        return isUsableModelDirectory(configuration.modelDirectory(hub: hubApi))
     }
 
     private static func isUsableModelDirectory(_ directory: URL) -> Bool {

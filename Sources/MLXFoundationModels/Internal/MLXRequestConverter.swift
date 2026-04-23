@@ -1,4 +1,5 @@
 #if MLX_ENABLED
+import AnyFoundationModelsSupport
 import Foundation
 import MLXLMCommon
 import OpenFoundationModels
@@ -65,7 +66,9 @@ struct MLXRequestConverter {
         for entry in resolved {
             switch entry {
             case .instructions(let instructions):
-                let text = segmentsToText(instructions.segments)
+                let text = segmentsToText(
+                    SessionToolInstructions.userAuthoredSegments(from: instructions.segments)
+                )
                 if !text.isEmpty {
                     messages.append(.system(text))
                 }

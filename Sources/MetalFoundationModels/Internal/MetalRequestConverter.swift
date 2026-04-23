@@ -1,4 +1,5 @@
 #if METAL_ENABLED
+import AnyFoundationModelsSupport
 import Foundation
 import OpenFoundationModels
 import OpenFoundationModelsExtra
@@ -97,7 +98,9 @@ struct MetalRequestConverter {
             guard case .instructions(let instructions) = entry else {
                 return nil
             }
-            let text = segmentsToText(instructions.segments)
+            let text = segmentsToText(
+                SessionToolInstructions.userAuthoredSegments(from: instructions.segments)
+            )
             return text.isEmpty ? nil : text
         }
 

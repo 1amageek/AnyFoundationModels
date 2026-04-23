@@ -4,10 +4,10 @@ import PackageDescription
 let package = Package(
     name: "AnyFoundationModels",
     platforms: [
-        .macOS(.v26),
-        .iOS(.v26),
-        .macCatalyst(.v26),
-        .visionOS(.v26)
+        .macOS("26.1"),
+        .iOS("26.1"),
+        .macCatalyst("26.1"),
+        .visionOS("26.1")
     ],
     products: [
         // Backends
@@ -31,11 +31,15 @@ let package = Package(
         // Claude
         .package(url: "https://github.com/apple/swift-configuration.git", from: "1.2.0"),
         // Metal
-        .package(url: "https://github.com/1amageek/swift-lm.git", exact: "0.4.0"),
+        .package(url: "https://github.com/1amageek/swift-lm.git", exact: "0.7.0"),
         // MLX
         .package(
             url: "https://github.com/1amageek/mlx-swift-lm.git",
-            revision: "473673459468695bf1e0892e833d74732d3e8bbf"
+            branch: "main"
+        ),
+        .package(
+            url: "https://github.com/huggingface/swift-huggingface.git",
+            from: "0.8.1"
         ),
         .package(
             url: "https://github.com/huggingface/swift-transformers",
@@ -43,10 +47,22 @@ let package = Package(
         ),
     ],
     targets: [
+        .target(
+            name: "AnyFoundationModelsSupport",
+            dependencies: [
+                .product(name: "OpenFoundationModels", package: "OpenFoundationModels"),
+            ],
+            swiftSettings: [
+                .swiftLanguageMode(.v6),
+            ]
+        ),
+
         // ===== Backend Targets =====
         .target(
             name: "OllamaFoundationModels",
             dependencies: [
+                .target(name: "AnyFoundationModelsSupport",
+                        condition: .when(traits: ["Ollama"])),
                 .product(name: "OpenFoundationModels", package: "OpenFoundationModels",
                          condition: .when(traits: ["Ollama"])),
                 .product(name: "OpenFoundationModelsExtra", package: "OpenFoundationModels",
@@ -60,6 +76,8 @@ let package = Package(
         .target(
             name: "ClaudeFoundationModels",
             dependencies: [
+                .target(name: "AnyFoundationModelsSupport",
+                        condition: .when(traits: ["Claude"])),
                 .product(name: "OpenFoundationModels", package: "OpenFoundationModels",
                          condition: .when(traits: ["Claude"])),
                 .product(name: "OpenFoundationModelsExtra", package: "OpenFoundationModels",
@@ -75,6 +93,8 @@ let package = Package(
         .target(
             name: "ResponseFoundationModels",
             dependencies: [
+                .target(name: "AnyFoundationModelsSupport",
+                        condition: .when(traits: ["Response"])),
                 .product(name: "OpenFoundationModels", package: "OpenFoundationModels",
                          condition: .when(traits: ["Response"])),
                 .product(name: "OpenFoundationModelsExtra", package: "OpenFoundationModels",
@@ -88,6 +108,8 @@ let package = Package(
         .target(
             name: "MLXFoundationModels",
             dependencies: [
+                .target(name: "AnyFoundationModelsSupport",
+                        condition: .when(traits: ["MLX"])),
                 .product(name: "OpenFoundationModels", package: "OpenFoundationModels",
                          moduleAliases: ["Generation": "FoundationGeneration"],
                          condition: .when(traits: ["MLX"])),
@@ -103,7 +125,12 @@ let package = Package(
                 .product(name: "MLXLMCommon", package: "mlx-swift-lm",
                          moduleAliases: ["Generation": "TransformersGeneration"],
                          condition: .when(traits: ["MLX"])),
-                .product(name: "Hub", package: "swift-transformers",
+                .product(name: "MLXHuggingFace", package: "mlx-swift-lm",
+                         moduleAliases: ["Generation": "TransformersGeneration"],
+                         condition: .when(traits: ["MLX"])),
+                .product(name: "HuggingFace", package: "swift-huggingface",
+                         condition: .when(traits: ["MLX"])),
+                .product(name: "Tokenizers", package: "swift-transformers",
                          moduleAliases: ["Generation": "TransformersGeneration"],
                          condition: .when(traits: ["MLX"])),
             ],
@@ -116,6 +143,8 @@ let package = Package(
         .target(
             name: "MetalFoundationModels",
             dependencies: [
+                .target(name: "AnyFoundationModelsSupport",
+                        condition: .when(traits: ["Metal"])),
                 .product(name: "OpenFoundationModels", package: "OpenFoundationModels",
                          condition: .when(traits: ["Metal"])),
                 .product(name: "OpenFoundationModelsExtra", package: "OpenFoundationModels",
@@ -130,6 +159,16 @@ let package = Package(
         ),
 
         // ===== Tests =====
+        .testTarget(
+            name: "AnyFoundationModelsSupportTests",
+            dependencies: [
+                .target(name: "AnyFoundationModelsSupport"),
+                .product(name: "OpenFoundationModels", package: "OpenFoundationModels"),
+            ],
+            swiftSettings: [
+                .swiftLanguageMode(.v6),
+            ]
+        ),
         .testTarget(
             name: "MetalFoundationModelsTests",
             dependencies: [

@@ -29,6 +29,31 @@ struct TranscriptConverterTests {
         #expect(result.request.input.isEmpty)
     }
 
+    @Test("Instructions drop session-generated tool appendix and keep native tools")
+    func buildInputItems_stripsGeneratedToolInstructions() throws {
+        let toolDef = Transcript.ToolDefinition(
+            name: "search",
+            description: "Search the web",
+            parameters: GenerationSchema(type: String.self, description: "query", properties: [])
+        )
+        let transcript = Transcript(entries: [
+            .instructions(Transcript.Instructions(
+                segments: [
+                    .text(Transcript.TextSegment(content: "You are helpful")),
+                    .text(Transcript.TextSegment(content: generatedToolInstructions())),
+                ],
+                toolDefinitions: [toolDef]
+            ))
+        ])
+
+        let result = makeBuilder().build(transcript: transcript, options: nil, stream: false)
+
+        #expect(result.request.instructions == "You are helpful")
+        let tools = try #require(result.request.tools)
+        #expect(tools.count == 1)
+        #expect(tools[0].name == "search")
+    }
+
     @Test("Prompt entry converts to user message")
     func buildInputItems_prompt() throws {
         let transcript = Transcript(entries: [
@@ -373,6 +398,14 @@ struct TranscriptConverterTests {
         // Should have a TextFormat (either jsonSchema or jsonObject)
         #expect(result.request.text != nil)
     }
+}
+
+private func generatedToolInstructions() -> String {
+    """
+    # Tools
+
+    In this environment you have access to a set of tools you can use to answer the user's question.
+    """
 }
 
 #endif

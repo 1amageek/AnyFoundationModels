@@ -1,4 +1,5 @@
 #if CLAUDE_ENABLED
+import AnyFoundationModelsSupport
 import Foundation
 import OpenFoundationModels
 import OpenFoundationModelsExtra
@@ -86,7 +87,9 @@ internal struct ClaudeRequestBuilder: OpenFoundationModelsExtra.RequestBuilder {
         for entry in resolved {
             switch entry {
             case .instructions(let i):
-                let content = segmentsToText(i.segments)
+                let content = segmentsToText(
+                    SessionToolInstructions.userAuthoredSegments(from: i.segments)
+                )
                 if !content.isEmpty { systemPrompt = content }
 
             case .prompt(let p):
