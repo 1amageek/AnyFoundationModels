@@ -1,13 +1,5 @@
 // swift-tools-version: 6.2
-import Foundation
 import PackageDescription
-
-let swiftLMDependency: Package.Dependency = {
-    if FileManager.default.fileExists(atPath: "../swift-lm/Package.swift") {
-        return .package(path: "../swift-lm")
-    }
-    return .package(url: "https://github.com/1amageek/swift-lm.git", from: "0.7.1")
-}()
 
 let package = Package(
     name: "AnyFoundationModels",
@@ -39,7 +31,7 @@ let package = Package(
         // Claude
         .package(url: "https://github.com/apple/swift-configuration.git", from: "1.2.0"),
         // Metal
-        swiftLMDependency,
+        .package(url: "https://github.com/1amageek/swift-lm.git", from: "0.7.1"),
         // MLX
         .package(
             url: "https://github.com/1amageek/mlx-swift-lm.git",
