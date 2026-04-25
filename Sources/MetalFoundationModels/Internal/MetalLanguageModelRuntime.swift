@@ -133,9 +133,6 @@ actor MetalLanguageModelRuntime {
     ) -> GenerationParameters {
         var params = GenerationParameters(
             streamChunkTokenCount: 1,
-            temperature: 0,
-            topP: 0.9,
-            repetitionPenalty: 1.05,
             repetitionContextSize: 64,
             reasoning: showsThinking ? .separate : .hidden
         )

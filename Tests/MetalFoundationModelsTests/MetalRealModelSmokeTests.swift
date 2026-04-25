@@ -25,7 +25,7 @@ struct MetalRealModelSmokeTests {
 
         let response = try await model.generate(
             transcript: transcript,
-            options: GenerationOptions(temperature: 0, maximumResponseTokens: 8)
+            options: GenerationOptions(maximumResponseTokens: 8)
         )
         let output = responseText(from: response)
 
@@ -46,13 +46,13 @@ struct MetalRealModelSmokeTests {
         let model = MetalLanguageModel(container: container, showsThinking: true)
         let transcript = Transcript(entries: [
             .prompt(.init(segments: [
-                .text(.init(content: "Briefly reason, then answer exactly one word: what is the capital of Japan?"))
+                .text(.init(content: "hi"))
             ]))
         ])
 
         let response = try await model.generate(
             transcript: transcript,
-            options: GenerationOptions(temperature: 0, maximumResponseTokens: 128)
+            options: GenerationOptions(maximumResponseTokens: 256)
         )
         let output = responseText(from: response)
         let reasoning = reasoningText(from: response)
@@ -60,7 +60,7 @@ struct MetalRealModelSmokeTests {
         print("[MetalRealModelSmoke] thinking output: \(output)")
         print("[MetalRealModelSmoke] thinking reasoning: \(reasoning)")
         #expect(!output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-        #expect(containsTokyo(output))
+        #expect(output.localizedCaseInsensitiveContains("hello"))
         #expect(!reasoning.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
     }
 

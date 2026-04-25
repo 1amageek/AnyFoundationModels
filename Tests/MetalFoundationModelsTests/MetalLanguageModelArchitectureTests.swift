@@ -454,8 +454,8 @@ struct MetalParameterTests {
 
         #expect(parameters.temperature == 0.25)
         #expect(parameters.maxTokens == 128)
-        #expect(parameters.topP == 0.9)
-        #expect(parameters.repetitionPenalty == 1.05)
+        #expect(parameters.topP == 1.0)
+        #expect(parameters.repetitionPenalty == nil)
         #expect(parameters.repetitionContextSize == 64)
         #expect(parameters.reasoning == .separate)
     }
