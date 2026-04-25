@@ -31,7 +31,7 @@ let package = Package(
         // Claude
         .package(url: "https://github.com/apple/swift-configuration.git", from: "1.2.0"),
         // Metal
-        .package(url: "https://github.com/1amageek/swift-lm.git", from: "0.8.1"),
+        .package(url: "https://github.com/1amageek/swift-lm.git", from: "0.8.2"),
         // MLX
         .package(
             url: "https://github.com/1amageek/mlx-swift-lm.git",

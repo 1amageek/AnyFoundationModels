@@ -171,9 +171,24 @@ struct MetalResponseConverter {
         let openTag = "<think>"
         let closeTag = "</think>"
 
-        if !text.localizedCaseInsensitiveContains(openTag),
+        if text.range(of: openTag, options: [.caseInsensitive]) == nil,
            let closeRange = text.range(of: closeTag, options: [.caseInsensitive]) {
-            let reasoning = String(text[..<closeRange.lowerBound])
+            let prefix = String(text[..<closeRange.lowerBound])
+            if prefix.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+               let secondCloseRange = text.range(
+                of: closeTag,
+                options: [.caseInsensitive],
+                range: closeRange.upperBound..<text.endIndex
+               ) {
+                let reasoning = String(text[closeRange.upperBound..<secondCloseRange.lowerBound])
+                let answer = String(text[secondCloseRange.upperBound...])
+                return ResponseChannels(
+                    answer: trimWhitespace ? answer.trimmingCharacters(in: .whitespacesAndNewlines) : answer,
+                    reasoning: trimWhitespace ? reasoning.trimmingCharacters(in: .whitespacesAndNewlines) : reasoning
+                )
+            }
+
+            let reasoning = prefix
             let answer = String(text[closeRange.upperBound...])
             return ResponseChannels(
                 answer: trimWhitespace ? answer.trimmingCharacters(in: .whitespacesAndNewlines) : answer,
@@ -194,7 +209,12 @@ struct MetalResponseConverter {
             }
 
             if text[index...].hasPrefix(closeTag) {
-                insideThink = false
+                if insideThink {
+                    insideThink = false
+                } else if !answer.isEmpty {
+                    reasoning += answer
+                    answer = ""
+                }
                 index = text.index(index, offsetBy: closeTag.count)
                 continue
             }

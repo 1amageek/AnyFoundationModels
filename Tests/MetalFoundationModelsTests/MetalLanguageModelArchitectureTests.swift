@@ -275,6 +275,36 @@ struct MetalResponseConverterTests {
         #expect(extractReasoning(from: entry) == "reasoning")
     }
 
+    @Test("Orphaned closing think tag treats prefix as reasoning")
+    func orphanedClosingThinkTag() throws {
+        let entry = try converter.finalEntry(
+            from: [
+                .text("prompt-opened reasoning</think>Visible answer"),
+                .completed(dummyCompletionInfo()),
+            ],
+            hasTools: false,
+            hasSchema: false
+        )
+
+        #expect(extractResponseText(from: entry) == "Visible answer")
+        #expect(extractReasoning(from: entry) == "prompt-opened reasoning")
+    }
+
+    @Test("Leading empty close then closing think tag treats middle as reasoning")
+    func leadingEmptyCloseThenReasoning() throws {
+        let entry = try converter.finalEntry(
+            from: [
+                .text("</think>\nprompt-opened reasoning</think>Visible answer"),
+                .completed(dummyCompletionInfo()),
+            ],
+            hasTools: false,
+            hasSchema: false
+        )
+
+        #expect(extractResponseText(from: entry) == "Visible answer")
+        #expect(extractReasoning(from: entry) == "prompt-opened reasoning")
+    }
+
     @Test("Separate reasoning channel is preserved")
     func separateReasoningChannel() throws {
         let entry = try converter.finalEntry(
@@ -428,6 +458,16 @@ struct MetalParameterTests {
         #expect(parameters.repetitionPenalty == 1.05)
         #expect(parameters.repetitionContextSize == 64)
         #expect(parameters.reasoning == .separate)
+    }
+
+    @Test("Thinking is hidden unless explicitly requested")
+    func thinkingHiddenByDefault() {
+        let parameters = MetalLanguageModelRuntime.makeParameters(
+            options: nil,
+            showsThinking: false
+        )
+
+        #expect(parameters.reasoning == .hidden)
     }
 }
 

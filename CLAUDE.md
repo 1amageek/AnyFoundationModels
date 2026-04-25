@@ -8,15 +8,36 @@ swift build --traits Ollama
 swift build --traits Claude
 swift build --traits Response
 swift build --traits MLX
+swift build --traits Metal
 
 # Test per-trait
+swift test --traits Ollama
 swift test --traits Claude
 swift test --traits Response
+swift test --traits MLX
+swift test --traits Metal
+```
+
+## Release Verification Policy
+
+swift-lm / Metal backend に影響するリリースは、build と通常テストだけでは完了扱いにしない。
+
+- `Package.swift` の `swift-lm` 更新、`MetalFoundationModels` の変更、Metal 推論に関係する dependency 更新では、必ず実モデル出力を確認してから tag / GitHub Release を作成する。
+- 実モデル確認は `MetalModelLoader` と `MetalLanguageModel` を通し、AnyFoundationModels の adapter 経由で短い deterministic prompt を実行する。
+- `swift-lm` upstream の release note や upstream test 結果は補助情報であり、AnyFoundationModels 側の実モデル確認の代替にしない。
+- 実モデル確認では、使用した model ID または local snapshot path、実行コマンド、出力、成功/失敗を release note または作業ログに残す。
+- モデルの download、local cache、Metal runtime、出力品質のいずれかを確認できない場合は release を止め、原因を報告する。
+- 既定の heavy test は通常テストからは外し、明示的な環境変数で実行する。現在の release smoke は次の形式で実行する:
+
+```bash
+ANYFM_REAL_MODEL_SMOKE=1 \
+ANYFM_REAL_MODEL_PATH="$HOME/.cache/huggingface/hub/models--Qwen--Qwen3.5-0.8B/snapshots/<snapshot>" \
+swift test --traits Metal --filter MetalRealModelSmokeTests
 ```
 
 ## Architecture
 
-4 backend modules that bridge OpenFoundationModels API to external LLM providers:
+5 backend modules that bridge OpenFoundationModels API to external LLM providers:
 
 | Module | Provider | Trait |
 |--------|----------|-------|
@@ -24,6 +45,7 @@ swift test --traits Response
 | ClaudeFoundationModels | Anthropic Messages API | `Claude` |
 | ResponseFoundationModels | OpenAI Responses API | `Response` |
 | MLXFoundationModels | MLX local inference | `MLX` |
+| MetalFoundationModels | swift-lm Metal inference | `Metal` |
 
 All backends depend on `OpenFoundationModels` and `OpenFoundationModelsExtra`.
 
