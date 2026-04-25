@@ -15,7 +15,9 @@ struct MetalRealModelSmokeTests {
             return
         }
 
-        let container = try await loadContainer(environment: environment)
+        guard let container = try await loadContainer(environment: environment) else {
+            return
+        }
         let model = MetalLanguageModel(container: container)
         let transcript = Transcript(entries: [
             .prompt(.init(segments: [
@@ -32,6 +34,7 @@ struct MetalRealModelSmokeTests {
         print("[MetalRealModelSmoke] output: \(output)")
         #expect(!output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
         #expect(output.localizedCaseInsensitiveContains("Tokyo"))
+        #expect(!output.contains("�"))
     }
 
     @Test("Real swift-lm thinking output through MetalLanguageModel", .timeLimit(.minutes(10)))
@@ -42,7 +45,9 @@ struct MetalRealModelSmokeTests {
             return
         }
 
-        let container = try await loadContainer(environment: environment)
+        guard let container = try await loadContainer(environment: environment) else {
+            return
+        }
         let model = MetalLanguageModel(container: container, showsThinking: true)
         let transcript = Transcript(entries: [
             .prompt(.init(segments: [
@@ -61,12 +66,14 @@ struct MetalRealModelSmokeTests {
         print("[MetalRealModelSmoke] thinking reasoning: \(reasoning)")
         #expect(!output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
         #expect(output.localizedCaseInsensitiveContains("hello"))
+        #expect(!output.contains("�"))
         #expect(!reasoning.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+        #expect(!reasoning.contains("�"))
     }
 
     private func loadContainer(
         environment: [String: String]
-    ) async throws -> SwiftLM.LanguageModelContainer {
+    ) async throws -> SwiftLM.LanguageModelContainer? {
         let loader = MetalModelLoader()
         if let modelPath = environment["ANYFM_REAL_MODEL_PATH"], !modelPath.isEmpty {
             let url = URL(fileURLWithPath: modelPath)
@@ -74,9 +81,29 @@ struct MetalRealModelSmokeTests {
             return try await loader.load(directory: url)
         }
 
-        let modelID = environment["ANYFM_REAL_MODEL_ID"] ?? "Qwen/Qwen3.5-0.8B"
-        print("[MetalRealModelSmoke] loading repo: \(modelID)")
-        return try await loader.load(repo: modelID)
+        for url in localLFMThinkingCandidates() where FileManager.default.fileExists(atPath: url.path) {
+            print("[MetalRealModelSmoke] loading local model: \(url.path)")
+            return try await loader.load(directory: url)
+        }
+
+        if let modelID = environment["ANYFM_REAL_MODEL_ID"], !modelID.isEmpty {
+            print("[MetalRealModelSmoke] loading repo: \(modelID)")
+            return try await loader.load(repo: modelID)
+        }
+
+        print("[Skip] Set ANYFM_REAL_MODEL_PATH to a local LFM thinking bundle to run real Metal model smoke.")
+        return nil
+    }
+
+    private func localLFMThinkingCandidates() -> [URL] {
+        let currentDirectory = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+        return [
+            URL(
+                fileURLWithPath: "../swift-lm/TestData/LFM2.5-1.2B-Thinking",
+                relativeTo: currentDirectory
+            ).standardizedFileURL,
+            URL(fileURLWithPath: "/Users/1amageek/Desktop/Robot/swift-lm/TestData/LFM2.5-1.2B-Thinking"),
+        ]
     }
 
     private func responseText(from entry: Transcript.Entry) -> String {

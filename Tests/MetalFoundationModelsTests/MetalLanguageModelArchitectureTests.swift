@@ -469,6 +469,20 @@ struct MetalParameterTests {
 
         #expect(parameters.reasoning == .hidden)
     }
+
+    @Test("Thinking is never requested inline when hidden")
+    func hiddenThinkingDoesNotRequestInlineReasoning() {
+        var options = GenerationOptions()
+        options.maximumResponseTokens = 32
+
+        let parameters = MetalLanguageModelRuntime.makeParameters(
+            options: options,
+            showsThinking: false
+        )
+
+        #expect(parameters.reasoning == .hidden)
+        #expect(parameters.reasoning != .inline)
+    }
 }
 
 @Suite("Metal Runtime Streaming Tests")
