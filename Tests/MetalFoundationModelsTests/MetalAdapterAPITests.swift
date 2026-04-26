@@ -23,10 +23,10 @@ struct MetalAdapterAPITests {
             loader.isCached(_:)
         let isDirectoryCached: @Sendable (URL) async -> Bool =
             loader.isCached(directory:)
-        let constructModel: @Sendable (LanguageModelContainer, Bool) -> MetalLanguageModel =
-            MetalLanguageModel.init(container:showsThinking:)
-        let legacyConstructModel: @Sendable (LanguageModelContainer, Bool) -> MetalLanguageModel =
-            MetalLanguageModel.init(languageModelContainer:showsThinking:)
+        let constructModel: @Sendable (LanguageModelContainer, Bool, MetalConfiguration) -> MetalLanguageModel =
+            MetalLanguageModel.init(container:showsThinking:configuration:)
+        let legacyConstructModel: @Sendable (LanguageModelContainer, Bool, MetalConfiguration) -> MetalLanguageModel =
+            MetalLanguageModel.init(languageModelContainer:showsThinking:configuration:)
 
         requireLanguageModel(MetalLanguageModel.self)
 
@@ -38,6 +38,23 @@ struct MetalAdapterAPITests {
         _ = isDirectoryCached
         _ = constructModel
         _ = legacyConstructModel
+    }
+
+    @Test("Existing call sites without configuration still compile thanks to default value")
+    func metalAdapterRetainsBackwardCompatibleCallSites() {
+        // These two declarations must keep type-checking even after the
+        // configuration parameter was added, because the parameter has a
+        // default value. They guard against an accidental breaking change
+        // (e.g. removing the default) that would force every existing call
+        // site to be updated.
+        let constructWithoutConfig: @Sendable (LanguageModelContainer) -> MetalLanguageModel = {
+            MetalLanguageModel(container: $0)
+        }
+        let constructWithThinking: @Sendable (LanguageModelContainer, Bool) -> MetalLanguageModel = {
+            MetalLanguageModel(container: $0, showsThinking: $1)
+        }
+        _ = constructWithoutConfig
+        _ = constructWithThinking
     }
 
     private func requireLanguageModel<T: LanguageModel>(_: T.Type) {}

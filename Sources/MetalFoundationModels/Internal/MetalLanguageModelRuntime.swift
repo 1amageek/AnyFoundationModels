@@ -6,14 +6,20 @@ import SwiftLM
 /// Orchestrates Metal inference using swift-lm.
 actor MetalLanguageModelRuntime {
     private let configuration: ModelConfiguration
+    private let metalConfiguration: MetalConfiguration
     private let generateStream:
         @Sendable (ModelInput, GenerationParameters) async throws -> AsyncStream<GenerationEvent>
     private let showsThinking: Bool
     private let requestConverter = MetalRequestConverter()
     private let responseConverter = MetalResponseConverter()
 
-    init(container: LanguageModelContainer, showsThinking: Bool) {
+    init(
+        container: LanguageModelContainer,
+        showsThinking: Bool,
+        configuration: MetalConfiguration = .default
+    ) {
         self.configuration = container.configuration
+        self.metalConfiguration = configuration
         self.generateStream = { input, parameters in
             try await container.generate(input, parameters: parameters)
         }
@@ -23,10 +29,12 @@ actor MetalLanguageModelRuntime {
     init(
         configuration: ModelConfiguration,
         showsThinking: Bool,
+        metalConfiguration: MetalConfiguration = .default,
         generateStream: @escaping
             @Sendable (ModelInput, GenerationParameters) async throws -> AsyncStream<GenerationEvent>
     ) {
         self.configuration = configuration
+        self.metalConfiguration = metalConfiguration
         self.generateStream = generateStream
         self.showsThinking = showsThinking
     }
@@ -41,7 +49,11 @@ actor MetalLanguageModelRuntime {
             configuration: configuration,
             showsThinking: showsThinking
         )
-        let parameters = Self.makeParameters(options: options, showsThinking: showsThinking)
+        let parameters = Self.makeParameters(
+            options: options,
+            showsThinking: showsThinking,
+            configuration: metalConfiguration
+        )
         let stream = try await generateStream(request.input, parameters)
 
         var generations: [GenerationEvent] = []
@@ -71,7 +83,8 @@ actor MetalLanguageModelRuntime {
                     )
                     let parameters = Self.makeParameters(
                         options: options,
-                        showsThinking: self.showsThinking
+                        showsThinking: self.showsThinking,
+                        configuration: self.metalConfiguration
                     )
                     let generationStream = try await self.generateStream(
                         request.input,
@@ -129,22 +142,38 @@ actor MetalLanguageModelRuntime {
 
     static func makeParameters(
         options: GenerationOptions?,
-        showsThinking: Bool
+        showsThinking: Bool,
+        configuration: MetalConfiguration = .default
     ) -> GenerationParameters {
         var params = GenerationParameters(
-            streamChunkTokenCount: 1,
-            repetitionContextSize: 64,
+            streamChunkTokenCount: configuration.streamChunkTokenCount,
+            topK: configuration.topK,
+            repetitionPenalty: configuration.repetitionPenalty,
+            presencePenalty: configuration.presencePenalty,
+            repetitionContextSize: configuration.repetitionContextSize,
             reasoning: showsThinking ? .separate : .hidden
         )
-
-        if let options {
-            if let temperature = options.temperature {
-                params.temperature = Float(temperature)
-            }
-            if let maxTokens = options.maximumResponseTokens {
-                params.maxTokens = maxTokens
-            }
+        if let topP = configuration.topP {
+            params.topP = topP
         }
+        if let minP = configuration.minP {
+            params.minP = minP
+        }
+
+        // temperature: configuration forces; otherwise GenerationOptions wins; else default.
+        if let configTemperature = configuration.temperature {
+            params.temperature = configTemperature
+        } else if let optionTemperature = options?.temperature {
+            params.temperature = Float(optionTemperature)
+        }
+
+        // maxTokens: configuration forces; otherwise GenerationOptions wins; else nil (no cap).
+        if let configMaxTokens = configuration.maxTokens {
+            params.maxTokens = configMaxTokens
+        } else if let optionMaxTokens = options?.maximumResponseTokens {
+            params.maxTokens = optionMaxTokens
+        }
+
         return params
     }
 }
