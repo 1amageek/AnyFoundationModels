@@ -71,6 +71,54 @@ struct MetalRealModelSmokeTests {
         #expect(!reasoning.contains("�"))
     }
 
+    @Test("Dump rendered prompt for LFM thinking 'hi'", .timeLimit(.minutes(10)))
+    func dumpRenderedThinkingPrompt() async throws {
+        let environment = ProcessInfo.processInfo.environment
+        guard environment["ANYFM_DUMP_PROMPT"] == "1" else {
+            print("[Skip] Set ANYFM_DUMP_PROMPT=1 to dump rendered prompts.")
+            return
+        }
+
+        guard let container = try await loadContainer(environment: environment) else {
+            return
+        }
+
+        let transcript = Transcript(entries: [
+            .prompt(.init(segments: [
+                .text(.init(content: "hi"))
+            ]))
+        ])
+
+        let converter = MetalRequestConverter()
+        let converted = try await converter.convert(
+            transcript: transcript,
+            configuration: container.configuration,
+            showsThinking: true
+        )
+
+        switch converted.input.prompt {
+        case .text(let text):
+            print("[PromptDump] ModelInput.prompt = .text(\(text))")
+        case .chat(let chat):
+            print("[PromptDump] ModelInput.prompt = .chat count=\(chat.count)")
+            for (index, message) in chat.enumerated() {
+                print("[PromptDump]  [\(index)] \(message)")
+            }
+        }
+        print("[PromptDump] hasTools=\(converted.hasTools) hasSchema=\(converted.hasSchema)")
+        print("[PromptDump] promptOptions.isThinkingEnabled=\(converted.input.promptOptions.isThinkingEnabled)")
+
+        let context = try LanguageModelContext(container)
+        let prepared = try await context.prepare(converted.input)
+
+        print("[PromptDump] === renderedText (begin) ===")
+        print(prepared.renderedText)
+        print("[PromptDump] === renderedText (end) ===")
+        print("[PromptDump] tokenIDs.count=\(prepared.tokenIDs.count)")
+
+        #expect(!prepared.renderedText.isEmpty)
+    }
+
     private func loadContainer(
         environment: [String: String]
     ) async throws -> SwiftLM.LanguageModelContainer? {
