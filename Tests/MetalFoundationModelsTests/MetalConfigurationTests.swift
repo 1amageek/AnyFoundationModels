@@ -29,6 +29,7 @@ struct MetalConfigurationTests {
         #expect(config.presencePenalty == nil)
         #expect(config.repetitionContextSize == 64)
         #expect(config.maxTokens == nil)
+        #expect(config.maxReasoningTokens == nil)
         #expect(config.streamChunkTokenCount == 1)
     }
 
@@ -51,6 +52,7 @@ struct MetalConfigurationTests {
         #expect(params.repetitionPenalty == nil)
         #expect(params.presencePenalty == nil)
         #expect(params.maxTokens == nil)
+        #expect(params.maxReasoningTokens == nil)
     }
 
     @Test("showsThinking still maps to .separate reasoning regardless of configuration")
@@ -122,6 +124,7 @@ struct MetalConfigurationTests {
             presencePenalty: 0.4,
             repetitionContextSize: 96,
             maxTokens: 256,
+            maxReasoningTokens: 384,
             streamChunkTokenCount: 4
         )
         let params = MetalLanguageModelRuntime.makeParameters(
@@ -137,7 +140,32 @@ struct MetalConfigurationTests {
         #expect(params.presencePenalty == 0.4)
         #expect(params.repetitionContextSize == 96)
         #expect(params.maxTokens == 256)
+        #expect(params.maxReasoningTokens == 384)
         #expect(params.streamChunkTokenCount == 4)
+    }
+
+    @Test("Configured maxReasoningTokens propagates and bounds the runtime's raw cap")
+    func configuredMaxReasoningTokensPropagates() {
+        let config = MetalConfiguration(maxReasoningTokens: 128)
+        let params = MetalLanguageModelRuntime.makeParameters(
+            options: nil,
+            showsThinking: true,
+            configuration: config
+        )
+        #expect(params.maxReasoningTokens == 128)
+        #expect(params.reasoning == .separate)
+    }
+
+    @Test("nil maxReasoningTokens falls through to swift-lm's historical multiplier")
+    func nilMaxReasoningTokensFallsThrough() {
+        let params = MetalLanguageModelRuntime.makeParameters(
+            options: nil,
+            showsThinking: true,
+            configuration: .default
+        )
+        // .default leaves maxReasoningTokens at nil so callers get the
+        // historical generous multiplier on the swift-lm side.
+        #expect(params.maxReasoningTokens == nil)
     }
 
     @Test("Sparse configuration only overrides the fields it sets")

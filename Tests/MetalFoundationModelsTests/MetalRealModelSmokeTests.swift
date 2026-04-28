@@ -71,6 +71,62 @@ struct MetalRealModelSmokeTests {
         #expect(!reasoning.contains("�"))
     }
 
+    @Test("Stream snapshots for Jardis-equivalent Gemma 4 'hi'", .timeLimit(.minutes(10)))
+    func streamSnapshotCountForJardisHi() async throws {
+        let environment = ProcessInfo.processInfo.environment
+        guard environment["ANYFM_STREAM_DIAG"] == "1" else {
+            print("[Skip] Set ANYFM_STREAM_DIAG=1 to run stream snapshot diagnostic.")
+            return
+        }
+
+        guard let container = try await loadContainer(environment: environment) else {
+            return
+        }
+
+        let showsThinking = environment["ANYFM_STREAM_DIAG_THINKING"] == "1"
+        let model = MetalLanguageModel(container: container, showsThinking: showsThinking)
+        let transcript = Transcript(entries: [
+            .prompt(.init(segments: [
+                .text(.init(content: environment["ANYFM_STREAM_DIAG_PROMPT"] ?? "hi"))
+            ]))
+        ])
+
+        let stream = model.stream(
+            transcript: transcript,
+            options: GenerationOptions(maximumResponseTokens: 256)
+        )
+
+        let started = Date()
+        var snapshotCount = 0
+        var firstSnapshotElapsed: TimeInterval?
+        var lastSnapshotElapsed: TimeInterval = 0
+
+        for try await entry in stream {
+            snapshotCount += 1
+            let elapsed = Date().timeIntervalSince(started)
+            lastSnapshotElapsed = elapsed
+            if firstSnapshotElapsed == nil {
+                firstSnapshotElapsed = elapsed
+                print(String(
+                    format: "[StreamDiag] first snapshot t=%.2fs entry=%@",
+                    elapsed,
+                    "\(entry)".prefix(160) as CVarArg
+                ))
+            }
+        }
+
+        let total = Date().timeIntervalSince(started)
+        print(String(
+            format: "[StreamDiag] showsThinking=%@ totalSnapshots=%d firstAt=%@ lastAt=%.2fs total=%.2fs",
+            showsThinking ? "true" : "false",
+            snapshotCount,
+            firstSnapshotElapsed.map { String(format: "%.2fs", $0) } ?? "n/a",
+            lastSnapshotElapsed,
+            total
+        ))
+        #expect(total < 600)
+    }
+
     @Test("Dump rendered prompt for LFM thinking 'hi'", .timeLimit(.minutes(10)))
     func dumpRenderedThinkingPrompt() async throws {
         let environment = ProcessInfo.processInfo.environment

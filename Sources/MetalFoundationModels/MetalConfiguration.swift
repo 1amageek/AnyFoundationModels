@@ -58,6 +58,15 @@ public struct MetalConfiguration: Sendable {
     /// runtime default cap applies.
     public let maxTokens: Int?
 
+    /// Forced hard cap on tokens generated inside the reasoning channel
+    /// before the model must close `</think>` (or equivalent). `nil` falls
+    /// through to swift-lm's historical generous multiplier
+    /// (`max(maxTokens * 16, maxTokens + 256)`), which lets a runaway
+    /// reasoning loop run far past the caller's intended `maxTokens`. Set
+    /// this to make such loops fail fast — the total raw cap then becomes
+    /// `maxTokens + maxReasoningTokens`.
+    public let maxReasoningTokens: Int?
+
     /// Maximum tokens to coalesce into one streamed text chunk. Always
     /// forced; defaults to the value the runtime has historically used.
     public let streamChunkTokenCount: Int
@@ -71,6 +80,7 @@ public struct MetalConfiguration: Sendable {
         presencePenalty: Float? = nil,
         repetitionContextSize: Int = 64,
         maxTokens: Int? = nil,
+        maxReasoningTokens: Int? = nil,
         streamChunkTokenCount: Int = 1
     ) {
         self.temperature = temperature
@@ -81,6 +91,7 @@ public struct MetalConfiguration: Sendable {
         self.presencePenalty = presencePenalty
         self.repetitionContextSize = repetitionContextSize
         self.maxTokens = maxTokens
+        self.maxReasoningTokens = maxReasoningTokens
         self.streamChunkTokenCount = streamChunkTokenCount
     }
 

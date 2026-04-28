@@ -174,6 +174,12 @@ actor MetalLanguageModelRuntime {
             params.maxTokens = optionMaxTokens
         }
 
+        // maxReasoningTokens: configuration forces; otherwise nil (swift-lm
+        // falls back to its historical generous multiplier).
+        if let configMaxReasoningTokens = configuration.maxReasoningTokens {
+            params.maxReasoningTokens = configMaxReasoningTokens
+        }
+
         return params
     }
 }
